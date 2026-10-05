@@ -1,0 +1,70 @@
+# PII_Closure_Map for chora-creation domain.
+#
+# Source-of-truth: .claude/skills/account-closure-saga/SKILL.md
+# Owning team: Team 1 (Content). Owning DB: chora_creation.
+#
+# Creation is the canonical creator-of-content domain. The closing user
+# may be an atom author — atoms themselves persist (they retain pedagogical
+# value); only authorship attribution is tokenised.
+#
+# AtomRevision is APPEND-ONLY per ddd-enforcement #4 — we never UPDATE or
+# DELETE revision content; we tokenise the snapshot fields that carry PII.
+
+domain: chora_creation
+version: "1.0"
+
+fields_to_tokenize:
+  - table: learning_atom
+    columns:
+      - column: created_by_display_name
+        strategy: tombstone_string
+        value: "Former member"
+      - column: created_by_email_snapshot
+        strategy: tombstone_email
+        value: "user-{hash}@redacted.invalid"
+      - column: published_by_display_name
+        strategy: tombstone_string
+        value: "Former member"
+
+  - table: atom_revision
+    columns:
+      # AtomRevision is append-only — but the per-revision authored_by
+      # snapshot fields can be tokenised in place (NOT a content edit).
+      - column: edited_by_display_name
+        strategy: tombstone_string
+        value: "Former member"
+      - column: edited_by_email_snapshot
+        strategy: tombstone_email
+        value: "user-{hash}@redacted.invalid"
+
+  - table: media_asset
+    columns:
+      - column: uploaded_by_display_name
+        strategy: tombstone_string
+        value: "Former member"
+      # Original filename may carry PII (e.g., "John-Smith-Resume.pdf").
+      # Hash it; preserve the extension for MIME compat.
+      - column: original_filename
+        strategy: hash
+        value: ""
+
+  - table: atom_validation_log
+    columns:
+      # 6-agent gate audit — tokenise display, preserve agent decisions.
+      - column: actor_display_name
+        strategy: tombstone_string
+        value: "Former member"
+
+retention_days_by_jurisdiction:
+  EU: 2557
+  SG: 2557
+  US: 1826
+  ZA: 1826
+  BR: 1826
+  default: 2557
+
+on_creator_closure:
+  # Atoms outlive their creator (pedagogical asset). Tokenise the
+  # creator's display + email snapshot; keep the atom.
+  strategy: tokenise_authorship_keep_atom
+  show_authorship_as: "Former member"
