@@ -225,7 +225,7 @@ func TestOutboxPublisher_Publish_RejectsInvalidTopic(t *testing.T) {
 
 func TestOutboxPublisher_Publish_PayloadIsBinaryProtobuf(t *testing.T) {
 	// Task #33 (2026-05-16) — outbox payload encoding migrated from JSON
-	// to canonical binary protobuf so GCP Pub/Sub Schema Registry (BINARY
+	// to canonical binary protobuf so the broker's binary schema (BINARY
 	// encoding) accepts the row at publish. The dispatcher passes bytes
 	// through unchanged, so the wire format of the payload column drives
 	// schema validation. Asserts the payload is NOT JSON anymore + the

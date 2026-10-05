@@ -386,7 +386,7 @@ func (r *InMemoryClosureRepo) SetFailNext(b bool) {
 // load or validate.
 //
 // Caller is responsible for binding the subscriber to its Pub/Sub source
-// (M12+: cgcpubsub.CloudSubscriber). In dev, the in-memory bus calls
+// (M12+: the cloud event-bus subscriber). In dev, the in-memory bus calls
 // Handle directly.
 //
 // W1.7 (2026-05-12): inbox parameter is REQUIRED. Pass

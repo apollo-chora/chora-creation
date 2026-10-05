@@ -46,7 +46,7 @@ type PublisherConfig struct {
 	// a TxStore bound to the caller's transaction.
 	Store Inserter
 
-	// SourceProject is the GCP project the service runs in (e.g.
+	// SourceProject is the project the service runs in (e.g.
 	// chora-local). Defaults to "chora-local".
 	SourceProject string
 
@@ -229,7 +229,7 @@ func (p *Publisher) Publish(ctx context.Context, e atom.Event) error {
 	}
 
 	// Producer-side encoding: emit canonical binary protobuf for topics
-	// whose GCP Pub/Sub Schema Registry schema is BINARY-encoded. JSON
+	// whose broker schema is BINARY-encoded. JSON
 	// payloads on a schema-attached topic dead-letter forever with
 	// "Invalid binary proto message". Per the gap surfaced in task #33
 	// (outbox protobuf encoding fix, 2026-05-16). Unsupported topics fall

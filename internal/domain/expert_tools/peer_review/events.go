@@ -12,7 +12,7 @@ package peer_review
 import "time"
 
 const (
-	// EnvSourceProject is the GCP project the chora-creation service runs in.
+	// EnvSourceProject is the project the chora-creation service runs in.
 	EnvSourceProject = "chora-content"
 	// EnvSourceService is this service's logical name.
 	EnvSourceService = "chora-creation"

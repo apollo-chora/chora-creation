@@ -86,7 +86,7 @@ func (p *CloudPublisher) Publish(ctx context.Context, e atom.Event) error {
 	}
 
 	// Producer-side encoding: emit canonical binary protobuf for topics
-	// whose GCP Pub/Sub Schema Registry schema is BINARY-encoded. JSON
+	// whose broker schema is BINARY-encoded. JSON
 	// payloads on a schema-attached topic dead-letter forever with
 	// "Invalid binary proto message". Per task #33 (2026-05-16). Unsupported
 	// topics fall back to JSON + log a one-shot WARN — these rows WILL be

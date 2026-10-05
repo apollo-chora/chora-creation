@@ -4,7 +4,7 @@
 //
 // Gap (task #33 — outbox protobuf encoding fix, 2026-05-16): chora-creation
 // outbox writer + JobEventPublisher were persisting / direct-publishing
-// JSON-marshalled payload bytes. GCP Pub/Sub Schema Registry rejects those
+// JSON-marshalled payload bytes. The broker's binary schema rejects those
 // at publish time with "Invalid binary proto message" because every deployed
 // chora.creation.* topic carries a BINARY-encoded schema. The fix is
 // producer-side: marshal to canonical proto wire bytes before the outbox

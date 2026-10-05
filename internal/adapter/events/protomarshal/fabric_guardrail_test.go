@@ -11,7 +11,7 @@
 // intent is preserved by embedding the original TF topic lists: only
 // topics that were in the broker's pubsub_topics AND not in
 // schemaless_topics are checked. This matches the original test's
-// semantics without the GCP Terraform dependency.
+// semantics without the cloud Terraform dependency.
 package protomarshal_test
 
 import (

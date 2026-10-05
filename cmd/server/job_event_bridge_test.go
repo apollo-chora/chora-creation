@@ -1,7 +1,7 @@
 // job_event_bridge_test.go — tests for the JobEventPublisher direct-publish
 // encoder. Task #33 (2026-05-16) — verifies that the chora.creation.question.*
 // topics + the bridge's atom.created.v1 emit path produce canonical binary
-// protobuf bytes (NOT JSON), so GCP Pub/Sub Schema Registry validation
+// protobuf bytes (NOT JSON), so the broker's binary schema validation
 // accepts the payload on the live BINARY-encoded topics.
 package main
 

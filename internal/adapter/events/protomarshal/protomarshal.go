@@ -1,5 +1,5 @@
 // Package protomarshal encodes chora-creation outbox event payloads to
-// canonical binary protobuf wire format so GCP Pub/Sub Schema Registry
+// canonical binary protobuf wire format so the broker's binary schema
 // validation (BINARY encoding) passes at publish time.
 //
 // Why hand-rolled

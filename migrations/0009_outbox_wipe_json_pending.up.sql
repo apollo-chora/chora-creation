@@ -6,7 +6,7 @@
 -- Background
 -- ----------
 -- Pre-fix outbox rows on chora_creation.outbox_events held JSON-marshalled
--- payload bytes that GCP Pub/Sub Schema Registry (BINARY encoding) rejects
+-- payload bytes that the broker's binary schema validation (BINARY encoding) rejects
 -- at publish time with "Invalid binary proto message". The dispatcher
 -- retries forever (MaxAttempts=5 then deadletter) and the row never
 -- publishes.

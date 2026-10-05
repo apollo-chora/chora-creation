@@ -48,7 +48,7 @@ type CollectionOutboxConfig struct {
 	// Store is the outbox-table backend. Required.
 	Store creationoutbox.Store
 
-	// SourceProject is the GCP project the service runs in (e.g.
+	// SourceProject is the project the service runs in (e.g.
 	// chora-local). Defaults to "chora-local".
 	SourceProject string
 
