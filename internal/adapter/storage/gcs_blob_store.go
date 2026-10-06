@@ -17,6 +17,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -91,10 +92,19 @@ func (s *S3BlobStore) Upload(ctx context.Context, req ports.UploadBlobReq) (port
 
 	key := BlobKeyWithSlot(req.TenantID, req.JobID, req.Slot)
 
-	// Stream body. Cap copy at MaxBlobBytes+1 so an oversized body trips
-	// the size check rather than silently uploading.
-	limit := io.LimitReader(req.Body, MaxBlobBytes+1)
-	if err := s.store.Put(ctx, key, limit, -1, req.MIME); err != nil {
+	// Buffer into a seekable reader: the S3 SDK signs PutObject by hashing
+	// the payload and rewinding it, which fails on the non-seekable stream
+	// io.LimitReader returns ("request stream is not seekable"). Cap the
+	// read at MaxBlobBytes+1 so an oversized body trips the size check
+	// rather than silently uploading.
+	buf, err := io.ReadAll(io.LimitReader(req.Body, MaxBlobBytes+1))
+	if err != nil {
+		return ports.UploadBlobResp{}, fmt.Errorf("s3 blob: read: %w", err)
+	}
+	if int64(len(buf)) > MaxBlobBytes {
+		return ports.UploadBlobResp{}, fmt.Errorf("s3 blob: size %d > max %d", len(buf), MaxBlobBytes)
+	}
+	if err := s.store.Put(ctx, key, bytes.NewReader(buf), int64(len(buf)), req.MIME); err != nil {
 		return ports.UploadBlobResp{}, fmt.Errorf("s3 blob: put: %w", err)
 	}
 

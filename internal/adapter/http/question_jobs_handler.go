@@ -2172,6 +2172,7 @@ func (h *QuestionJobsHandler) acceptQuestionJob(w http.ResponseWriter, r *http.R
 		"job_id":          jobID,
 		"atom_id":         atomID,
 		"author_gcid":     authorGCID,
+		"tenant_id":       tenantID,
 		"status":          string(terminal),
 		"candidate_count": len(drafts),
 		"completed_at":    time.Now().UTC().Format(time.RFC3339Nano),

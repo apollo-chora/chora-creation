@@ -135,6 +135,7 @@ type completionEvent struct {
 	JobID           string `json:"job_id"`
 	AtomID          string `json:"atom_id"`
 	AuthorGCID      string `json:"author_gcid"`
+	TenantID        string `json:"tenant_id"`
 	Status          string `json:"status"`
 	CandidateCount  int    `json:"candidate_count"`
 	FailureCategory string `json:"failure_category,omitempty"`
@@ -1004,6 +1005,7 @@ func (s *QuestionSubscriber) succeed(ctx context.Context, job *question.ComposeJ
 		JobID:          job.JobID,
 		AtomID:         job.AtomID,
 		AuthorGCID:     job.AuthorGCID,
+		TenantID:       job.TenantID,
 		Status:         string(question.JobStatusSucceeded),
 		CandidateCount: len(drafts),
 		CompletedAt:    time.Now().UTC().Format(time.RFC3339Nano),
@@ -1036,6 +1038,7 @@ func (s *QuestionSubscriber) fail(ctx context.Context, job *question.ComposeJob,
 		JobID:           job.JobID,
 		AtomID:          job.AtomID,
 		AuthorGCID:      job.AuthorGCID,
+		TenantID:        job.TenantID,
 		Status:          string(question.JobStatusFailed),
 		FailureCategory: category,
 		FailureMessage:  message,

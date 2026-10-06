@@ -989,6 +989,7 @@ func (s *AiAssistTerminalSubscriber) emitQuestionCompletion(
 		JobID:           job.JobID,
 		AtomID:          job.AtomID,
 		AuthorGCID:      job.AuthorGCID,
+		TenantID:        job.TenantID,
 		Status:          string(status),
 		CandidateCount:  candidateCount,
 		FailureCategory: failureCategory,
