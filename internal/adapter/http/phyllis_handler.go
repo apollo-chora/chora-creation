@@ -410,26 +410,23 @@ func (h *PhyllisHandler) patchAtom(w http.ResponseWriter, r *http.Request, id st
 	if refuseNonAuthor(w, a, gcid) {
 		return
 	}
-	rev, err := a.AppendRevision(atom.AppendRevisionParams{
+	if _, err := a.AppendRevision(atom.AppendRevisionParams{
 		Body:       req.Body,
 		AuthoredBy: authoredBy,
 		SourceType: srcType,
-	})
-	if err != nil {
+	}); err != nil {
 		writeError(w, http.StatusBadRequest, "CREATION_INVALID_REVISION", err.Error())
 		return
 	}
-	// One transaction for the appended revision and the event announcing it
-	// (see createAtom above).
-	traceparent := effectiveTraceparent(r)
-	tracestate := r.Header.Get("tracestate")
-	ev := atom.NewAtomRevisedEvent(a, rev, traceparent, tracestate)
-	if srcType == atom.SourceAIAssist {
-		ev.ChoraImdaDimension = "accountability"
-		ev.ImdaLifecycleStage = "runtime"
-	}
-	if err := h.writer.SaveAndPublish(r.Context(), a, ev); err != nil {
-		log.Printf("patchAtom: save+enqueue failed, nothing committed: %v", err)
+	// The appended revision is Creation-local. chora.creation.atom.revised.v1
+	// has no contract and no binary encoder (chora-contracts ships no
+	// atom/revised schema), so publishing it JSON-falls-back and the schema
+	// registry rejects the row — and no domain consumes it. The cross-domain
+	// atom projections carry metadata only (body/revision never leave the
+	// domain), so an append needs no event. Persist the atom row (new body +
+	// revision) directly; there is no outbox row to keep it atomic with.
+	if err := h.repo.Save(r.Context(), a); err != nil {
+		log.Printf("patchAtom: save failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "CREATION_REPO_ERROR", "failed to persist revision")
 		return
 	}

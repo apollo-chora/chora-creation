@@ -200,10 +200,11 @@ func TestPhyllis_PostAtoms_OutboxInsertFails_RollsBackAndFails(t *testing.T) {
 	}
 }
 
-// TestPhyllis_PatchAtom_OutboxInsertFails_RollsBackAndFails covers the second
-// call site: PATCH appends a revision and emits atom.revised.v1 through the
-// same shape.
-func TestPhyllis_PatchAtom_OutboxInsertFails_RollsBackAndFails(t *testing.T) {
+// TestPhyllis_PatchAtom_PersistsRevisionWithoutOutboxRow covers the second
+// call site. PATCH appends a revision but emits NO event: atom.revised.v1 has
+// no contract, no binary encoder and no consumer, so the revision is
+// Creation-local and the write must not depend on the outbox being reachable.
+func TestPhyllis_PatchAtom_PersistsRevisionWithoutOutboxRow(t *testing.T) {
 	t.Parallel()
 
 	rec := &txRecorder{}
@@ -222,22 +223,26 @@ func TestPhyllis_PatchAtom_OutboxInsertFails_RollsBackAndFails(t *testing.T) {
 		t.Fatalf("seed save: %v", err)
 	}
 
-	// Now sever the outbox and append a revision.
+	// Sever the outbox: the append emits no event, so it must still succeed.
 	rec.failOn = "outbox_events"
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, authedReq(http.MethodPatch, "/v1/atoms/"+seeded.AtomID, map[string]any{
-		"body":        "revised body whose event never queued",
+		"body":        "revised body with no event",
 		"source_type": "manual",
 	}))
 
-	if len(rec.transactions) != 1 {
-		t.Fatalf("transactions opened = %d; want 1. This test cannot see the defect it targets", len(rec.transactions))
-	}
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d; want 500. A revision whose event never queued must not be reported as applied. body=%s",
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d; want 200 (the revision append emits no event). body=%s",
 			w.Code, w.Body.String())
 	}
-	if len(rec.committed) != 0 {
-		t.Errorf("committed statements = %d; want 0 (the revision rolls back with its event): %v", len(rec.committed), rec.committed)
+	if got := rec.committedMatching("outbox_events"); got != 0 {
+		t.Errorf("committed outbox_events statements = %d; want 0 (the append must emit no event)", got)
+	}
+	got, err := repo.Get(context.Background(), tenantA, seeded.AtomID)
+	if err != nil {
+		t.Fatalf("repo.Get after PATCH: %v", err)
+	}
+	if len(got.RevisionHistory()) != 2 {
+		t.Errorf("revision history len = %d; want 2 (the append must still persist)", len(got.RevisionHistory()))
 	}
 }

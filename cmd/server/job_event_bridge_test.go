@@ -223,6 +223,86 @@ func TestEncodeBridgePayload_TypedStruct_RoundTripsViaJSON(t *testing.T) {
 	}
 }
 
+// TestEncodeBridgePayload_QuestionGenerationCompleted_CarriesTenantID locks in
+// the tenant_id fix for the AI-assist question-completion events. The v2
+// payload schema has NO tenant_id field (envelope field 3 carries it), so the
+// payload key the emit sites set must reach the ENVELOPE — never the payload —
+// or every consumer keyed on the tenant sees an empty envelope.tenant_id.
+func TestEncodeBridgePayload_QuestionGenerationCompleted_CarriesTenantID(t *testing.T) {
+	const tenant = "01971a90-cccc-7000-8000-000000000001"
+	// Mirrors pubsub.completionEvent (question_subscriber.go) — the typed
+	// struct path the succeed/fail/emitQuestionCompletion call sites use.
+	evt := struct {
+		JobID          string `json:"job_id"`
+		AtomID         string `json:"atom_id"`
+		AuthorGCID     string `json:"author_gcid"`
+		TenantID       string `json:"tenant_id"`
+		Status         string `json:"status"`
+		CandidateCount int    `json:"candidate_count"`
+		CompletedAt    string `json:"completed_at"`
+		Operation      string `json:"operation"`
+	}{
+		JobID:          "01971a90-eeee-7000-8000-000000000001",
+		AtomID:         "01971a90-aaaa-7000-8000-000000000001",
+		AuthorGCID:     "01971a90-bbbb-7000-8000-000000000001",
+		TenantID:       tenant,
+		Status:         "succeeded",
+		CandidateCount: 3,
+		CompletedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+		Operation:      "compose",
+	}
+
+	env, bz, err := encodeBridgePayload("chora.creation.question.generation_completed.v2", evt)
+	if err != nil {
+		t.Fatalf("encodeBridgePayload: %v", err)
+	}
+	if env.TenantID != tenant {
+		t.Fatalf("envelope.TenantID = %q; want %q", env.TenantID, tenant)
+	}
+
+	// Decode the wire bytes the way a binary consumer's envelope decoder does:
+	// payload field 1 is the Envelope submessage, and its field 3 is tenant_id.
+	envelopeBytes := wireFieldBytes(t, bz, 1)
+	if got := string(wireFieldBytes(t, envelopeBytes, 3)); got != tenant {
+		t.Fatalf("wire envelope.tenant_id = %q; want %q", got, tenant)
+	}
+}
+
+// wireFieldBytes returns the raw bytes of the first length-delimited field
+// `want` in bz, skipping varint fields. Fails the test if absent.
+func wireFieldBytes(t *testing.T, bz []byte, want protowire.Number) []byte {
+	t.Helper()
+	rem := bz
+	for len(rem) > 0 {
+		num, typ, n := protowire.ConsumeTag(rem)
+		if n < 0 {
+			t.Fatalf("invalid tag")
+		}
+		rem = rem[n:]
+		switch typ {
+		case protowire.BytesType:
+			v, m := protowire.ConsumeBytes(rem)
+			if m < 0 {
+				t.Fatalf("invalid bytes field %d", num)
+			}
+			if num == want {
+				return v
+			}
+			rem = rem[m:]
+		case protowire.VarintType:
+			_, m := protowire.ConsumeVarint(rem)
+			if m < 0 {
+				t.Fatalf("invalid varint field %d", num)
+			}
+			rem = rem[m:]
+		default:
+			t.Fatalf("unexpected wire type %d for field %d", typ, num)
+		}
+	}
+	t.Fatalf("field %d not found", want)
+	return nil
+}
+
 // TestEnvelopeFromPayloadMap_SynthesisesUUIDv7 — every emit must mint a valid
 // event_id + idempotency_key on the envelope so the Schema Registry contract
 // holds.

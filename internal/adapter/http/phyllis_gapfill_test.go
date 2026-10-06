@@ -22,7 +22,7 @@ import (
 // PATCH /v1/atoms/{id} → AppendRevision
 // -----------------------------------------------------------------------------
 
-func TestPhyllis_PatchAtom_AppendsRevisionAndPublishesRevisedEvent(t *testing.T) {
+func TestPhyllis_PatchAtom_AppendsRevisionWithoutPublishingEvent(t *testing.T) {
 	t.Parallel()
 
 	pub := &recordingPub{}
@@ -75,22 +75,14 @@ func TestPhyllis_PatchAtom_AppendsRevisionAndPublishesRevisedEvent(t *testing.T)
 		t.Errorf("revision history len = %d; want 2", len(a.RevisionHistory()))
 	}
 
-	// Event: chora.creation.atom.revised.v1 published once (in addition to
-	// the initial chora.creation.atom.created.v1).
-	revisedEvents := 0
+	// Event: the append emits NOTHING. chora.creation.atom.revised.v1 has no
+	// contract and no binary encoder, so publishing it would JSON-fall-back
+	// and be rejected at the schema registry — and no domain consumes it. The
+	// only event in the recorder is the initial atom.created.v1.
 	for _, e := range pub.events {
 		if e.Type == atom.EventTypeAtomRevised {
-			revisedEvents++
-			if e.AtomID != atomID {
-				t.Errorf("revised event atom_id = %q; want %s", e.AtomID, atomID)
-			}
-			if e.RevisionNumber != 2 {
-				t.Errorf("revised event revision_number = %d; want 2", e.RevisionNumber)
-			}
+			t.Errorf("PATCH emitted atom.revised.v1 (%+v); it has no contract/encoder/consumer and must not be published", e)
 		}
-	}
-	if revisedEvents != 1 {
-		t.Errorf("revised events count = %d; want 1", revisedEvents)
 	}
 }
 
