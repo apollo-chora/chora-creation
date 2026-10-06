@@ -60,7 +60,14 @@ func NewS3BlobStore(cfg S3BlobStoreConfig) (*S3BlobStore, error) {
 		return nil, fmt.Errorf("S3 bucket not set: %w", ports.ErrBlobStoreNotWired)
 	}
 	if cfg.Store == nil {
-		store, err := objectstore.New(objectstore.ConfigFromEnv())
+		// The objectstore's own bucket must be the blob store's bucket. It
+		// otherwise reads S3_BUCKET from the environment, which this service
+		// also sets for the atom-media store — the upload would then land in
+		// that bucket while BlobURI() advertises GCS_BUCKET_BATCH_UPLOADS, and
+		// every consumer dereferencing the URI gets NoSuchKey.
+		conf := objectstore.ConfigFromEnv()
+		conf.Bucket = strings.TrimSpace(cfg.Bucket)
+		store, err := objectstore.New(conf)
 		if err != nil {
 			return nil, fmt.Errorf("objectstore.New: %w", err)
 		}
