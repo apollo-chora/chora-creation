@@ -780,8 +780,9 @@ func TestGetQuestion_NoRolesHeader_Forbidden(t *testing.T) {
 }
 
 // The instructor arm of the canonical predicate: chora-creation must mirror the
-// BFF's HasAuthorRole (author|instructor), which already gates correct_option_id
-// on question_payload. Diverging would make the two answer-key doors disagree.
+// BFF's HasAuthorRole (author|instructor|admin|owner|tenant_admin), which already
+// gates correct_option_id on question_payload. Diverging would make the two
+// answer-key doors disagree.
 func TestGetQuestion_InstructorAllowed_MirrorsBFFPredicate(t *testing.T) {
 	t.Parallel()
 	srv, _, _, atomID := newQuestionServer(t)
@@ -793,6 +794,40 @@ func TestGetQuestion_InstructorAllowed_MirrorsBFFPredicate(t *testing.T) {
 	srv.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("instructor is an author-role per the BFF predicate; got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// The tenant-admin arm. The accept route (POST .../question-jobs/{job}/accept)
+// is NOT gated, so an `admin` can mint a question; without this arm the very
+// next read 403s and the atom editor renders empty — the generated content
+// looks lost.
+func TestGetQuestion_AdminAllowed_MirrorsBFFPredicate(t *testing.T) {
+	t.Parallel()
+	srv, _, _, atomID := newQuestionServer(t)
+	qID := seedQuestion(t, srv, atomID)
+
+	r := learnerJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+qID, nil)
+	r.Header.Set(servicemesh.HeaderUserRoles, "admin")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("admin must read back what the ungated accept route let it create; got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// The other half of the gate: a non-authoring role is still refused, so the
+// widening did not open the answer key to the whole tenant.
+func TestGetQuestion_AuditorRefused(t *testing.T) {
+	t.Parallel()
+	srv, _, _, atomID := newQuestionServer(t)
+	qID := seedQuestion(t, srv, atomID)
+
+	r := learnerJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+qID, nil)
+	r.Header.Set(servicemesh.HeaderUserRoles, "auditor")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("auditor must not read the answer key; got %d %s", w.Code, w.Body.String())
 	}
 }
 

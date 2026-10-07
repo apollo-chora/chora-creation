@@ -126,6 +126,18 @@ func TestHasAuthorRole(t *testing.T) {
 		{"mixed includes author", "learner,author,observer", true},
 		{"case-insensitive", "AUTHOR", true},
 		{"spaces trimmed", " learner , author ", true},
+		// CHO-2254 gated the authoring subtree to author|instructor, which left
+		// the tenant admin able to CREATE a question (the accept route is
+		// ungated) but 403 on reading it back. The tenant-administrative roles
+		// are admitted so the two doors agree.
+		{"admin yes", "admin", true},
+		{"ADMIN yes", "ADMIN", true},
+		{"owner yes", "owner", true},
+		{"tenant_admin yes", "tenant_admin", true},
+		{"mixed includes admin", "learner,admin", true},
+		{"auditor no", "auditor", false},
+		{"proctor no", "proctor", false},
+		{"support_agent no", "support_agent", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

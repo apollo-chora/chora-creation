@@ -574,11 +574,23 @@ func parsePositiveInt(s string, fallback int) int {
 
 // hasAuthorRole reports whether the caller may use the authoring surface.
 //
-// It mirrors the BFF's phyllis.AuthCtx.HasAuthorRole (author | instructor) —
-// deliberately the SAME predicate that already gates the author-mode fields
-// (correct_option_id on question_payload) on GET /api/atoms/{id}. Both doors
-// expose the same secret, so they must agree on who may see it; widening this
-// set (e.g. adding admin) is a decision for BOTH doors, not a local convenience.
+// It mirrors the BFF's phyllis.AuthCtx.HasAuthorRole (author | instructor |
+// admin | owner | tenant_admin) — deliberately the SAME predicate that already
+// gates the author-mode fields (correct_option_id on question_payload) on GET
+// /api/atoms/{id}. Both doors expose the same secret, so they must agree on who
+// may see it; widening this set is a decision for BOTH doors, not a local
+// convenience.
+//
+// CHO-2254 gated this subtree to author|instructor only. That left the tenant's
+// own administrator unable to READ BACK what the authoring surface let them
+// CREATE: POST /api/atoms/{id}/question-jobs/{job}/accept is NOT gated, so an
+// `admin` could mint a question and then take 403 from
+// GET .../questions/{id} — the atom editor rendered empty and the generated
+// content looked lost. The tenant-administrative roles are therefore admitted:
+// they are the tenant's most trusted operators, and the gate exists to keep
+// LEARNERS (and auditor / support / proctor) out of the answer key, not to keep
+// the tenant's own admin out of their own content. This is the "ATOM Phase 2
+// role elevation for instructor/admin" the media handler's TODO defers.
 //
 // Roles ride the canonical mesh header the gateway populates via
 // servicemesh.MarshalToHeaders (mTLS-bound; a client cannot set it).
@@ -595,7 +607,7 @@ func hasAuthorRole(r *http.Request) bool {
 	}
 	for _, role := range strings.Split(roles, ",") {
 		switch strings.TrimSpace(role) {
-		case "author", "instructor":
+		case "author", "instructor", "admin", "owner", "tenant_admin":
 			return true
 		}
 	}
