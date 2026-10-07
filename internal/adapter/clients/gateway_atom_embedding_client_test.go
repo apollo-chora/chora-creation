@@ -84,8 +84,8 @@ func TestGatewayAtomEmbeddingClient_SendsWireCompleteRequest(t *testing.T) {
 	if req.GetLogicalModelId() != "text-embedding-004" {
 		t.Errorf("logical_model_id = %q (must be pinned, not empty)", req.GetLogicalModelId())
 	}
-	if req.GetOutputDimensions() != 768 {
-		t.Errorf("output_dimensions = %d", req.GetOutputDimensions())
+	if req.GetOutputDimensions() != 1024 {
+		t.Errorf("output_dimensions = %d (must match the vector(1024) column)", req.GetOutputDimensions())
 	}
 	if strings.TrimSpace(req.GetInvocationId()) == "" {
 		t.Errorf("invocation_id empty; ledger idempotency requires a caller UUIDv7")

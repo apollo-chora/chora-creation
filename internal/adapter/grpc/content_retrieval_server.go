@@ -2,7 +2,7 @@
 // (Epic-1b W4): SearchEmbeddings answers chora-consumption's Growth-Edge
 // drill-atom resolution with the nearest PUBLISHED atoms by cosine distance
 // over chora_creation.atom_embeddings (pgvector). The caller supplies the
-// 768-d query embedding — this server never embeds.
+// 1024-d query embedding — this server never embeds.
 //
 // Per `feedback_no_stubs_real_wiring`: registered unconditionally; a nil
 // searcher dep returns FAILED_PRECONDITION (fail-loud, distinguishable from

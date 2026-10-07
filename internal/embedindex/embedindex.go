@@ -1,7 +1,7 @@
 // Package embedindex — the atom-embedding indexer (Epic-1b W4).
 //
 // Composes an atom's text (title + stem + body, capped), embeds it
-// (text-embedding-004, 768-d — the SAME space chora-consumption mints
+// (text-embedding-004, 1024-d — the SAME space chora-consumption mints
 // Growth-Edge concept vectors in), and upserts atom_embeddings. Two drivers:
 //
 //   - publish-time: the publish handler fires IndexAtom asynchronously after
@@ -34,7 +34,7 @@ type Atom struct {
 	AuthorGCID string
 }
 
-// Embedder produces the 768-d document embedding. Tenant + gcid ride
+// Embedder produces the 1024-d document embedding. Tenant + gcid ride
 // explicitly (creation never stamps tracing ctx keys): the gateway refuses an
 // unattributed embed, so the port carries the attribution rather than hoping
 // the ctx does.

@@ -17,7 +17,7 @@
 // space consumption mints Growth-Edge vectors in; both sides MUST share one
 // space for cosine search to mean anything) and ModelID() returns the same
 // constant, so the atom_embeddings.model_id label can never drift from what
-// was requested. 768-d matches the vector(768) column, sent explicitly.
+// was requested. 1024-d matches the vector(1024) column, sent explicitly.
 //
 // Error contract: parity with the retired AtomEmbeddingClient, the same
 // agentengine sentinels, so the publish path's soft-fail and the backfill's
@@ -71,9 +71,11 @@ const (
 	// pair (consumption embeds queries on its side).
 	atomEmbedTaskTypeDocument = "RETRIEVAL_DOCUMENT"
 
-	// atomEmbedOutputDimensions matches atom_embeddings vector(768). Sent
-	// explicitly, never left to a remote default.
-	atomEmbedOutputDimensions = 768
+	// atomEmbedOutputDimensions matches atom_embeddings vector(1024) — the
+	// LiquidAI LFM2.5 embedding route's native width (see the registry's
+	// `text-embedding-004` entry). Sent explicitly, never left to a remote
+	// default.
+	atomEmbedOutputDimensions = 1024
 )
 
 // atomEmbedGRPC is the slice of mgv1.ModelGatewayServiceClient this adapter
@@ -122,7 +124,7 @@ func (c *GatewayAtomEmbeddingClient) ModelID() string {
 	return atomEmbedLogicalModelID
 }
 
-// Embed produces one 768-d document embedding for the supplied atom text,
+// Embed produces one 1024-d document embedding for the supplied atom text,
 // attributed to the given tenant + actor (the atom's author). All three are
 // REQUIRED by the gateway; a gap refuses loud here, before any RPC.
 func (c *GatewayAtomEmbeddingClient) Embed(ctx context.Context, tenantID, gcid, text string) ([]float32, error) {
