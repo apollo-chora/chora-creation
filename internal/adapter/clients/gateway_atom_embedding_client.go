@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -62,10 +63,9 @@ const (
 	// creation-to-gateway caller.
 	atomEmbedCrewKind = "content_creation"
 
-	// atomEmbedLogicalModelID pins the embedding model REQUESTED on the wire;
-	// ModelID() returns the same constant so request and stored label cannot
-	// drift apart.
-	atomEmbedLogicalModelID = "text-embedding-004"
+	// atomEmbedDefaultLogicalModelID is the default embedding model requested
+	// on the wire. Override with EMBEDDING_LOGICAL_MODEL_ID.
+	atomEmbedDefaultLogicalModelID = "text-embedding-004"
 
 	// atomEmbedTaskTypeDocument: atoms are the DOCUMENT side of the retrieval
 	// pair (consumption embeds queries on its side).
@@ -89,6 +89,7 @@ type atomEmbedGRPC interface {
 type GatewayAtomEmbeddingClient struct {
 	client  atomEmbedGRPC
 	timeout time.Duration
+	modelID string
 }
 
 // NewGatewayAtomEmbeddingClient dials the gateway at the mesh target. An
@@ -103,11 +104,15 @@ func NewGatewayAtomEmbeddingClient(target string, timeout time.Duration) (*Gatew
 	if timeout <= 0 {
 		timeout = atomEmbedDefaultTimeout
 	}
+	modelID := strings.TrimSpace(os.Getenv("EMBEDDING_LOGICAL_MODEL_ID"))
+	if modelID == "" {
+		modelID = atomEmbedDefaultLogicalModelID
+	}
 	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("gateway_atom_embedding_client: dial %q: %w", target, err)
 	}
-	return &GatewayAtomEmbeddingClient{client: mgv1.NewModelGatewayServiceClient(conn), timeout: timeout}, nil
+	return &GatewayAtomEmbeddingClient{client: mgv1.NewModelGatewayServiceClient(conn), timeout: timeout, modelID: modelID}, nil
 }
 
 // NewGatewayAtomEmbeddingClientFromStub injects a fake gRPC client (tests).
@@ -115,13 +120,17 @@ func NewGatewayAtomEmbeddingClientFromStub(stub atomEmbedGRPC, timeout time.Dura
 	if timeout <= 0 {
 		timeout = atomEmbedDefaultTimeout
 	}
-	return &GatewayAtomEmbeddingClient{client: stub, timeout: timeout}
+	modelID := strings.TrimSpace(os.Getenv("EMBEDDING_LOGICAL_MODEL_ID"))
+	if modelID == "" {
+		modelID = atomEmbedDefaultLogicalModelID
+	}
+	return &GatewayAtomEmbeddingClient{client: stub, timeout: timeout, modelID: modelID}
 }
 
-// ModelID reports the pinned logical embedding model for the
+// ModelID reports the logical embedding model for the
 // atom_embeddings.model_id column.
 func (c *GatewayAtomEmbeddingClient) ModelID() string {
-	return atomEmbedLogicalModelID
+	return c.modelID
 }
 
 // Embed produces one 1024-d document embedding for the supplied atom text,
@@ -150,7 +159,7 @@ func (c *GatewayAtomEmbeddingClient) Embed(ctx context.Context, tenantID, gcid, 
 		Gcid:             gcid,
 		AgentId:          atomEmbedAgentID,
 		CrewKind:         atomEmbedCrewKind,
-		LogicalModelId:   atomEmbedLogicalModelID,
+		LogicalModelId:   c.modelID,
 		Text:             text,
 		TaskType:         atomEmbedTaskTypeDocument,
 		OutputDimensions: atomEmbedOutputDimensions,
