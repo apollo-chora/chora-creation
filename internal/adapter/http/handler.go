@@ -672,6 +672,17 @@ func (h *AtomHandler) atomsItem(w http.ResponseWriter, r *http.Request) {
 			h.patchAtomReuseVisibility(w, r, atomID)
 			return
 		}
+		// CREATION-1 — POST /api/atoms/{atom_id}/archive delegates to the
+		// SoftDelete path (deleteAtom), which already emits atom.archived.v1.
+		if rest == "/archive" {
+			if r.Method != http.MethodPost {
+				writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED",
+					"only POST is supported on /api/atoms/{id}/archive")
+				return
+			}
+			h.deleteAtom(w, r, atomID)
+			return
+		}
 		// Other nested sub-resources are not yet supported.
 		writeError(w, http.StatusNotFound, "CREATION_NOT_FOUND", "unknown sub-resource")
 		return
