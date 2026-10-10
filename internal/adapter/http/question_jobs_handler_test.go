@@ -751,6 +751,13 @@ func TestAcceptQuestionJob_HonorsOverrides_EditabilityInvariant(t *testing.T) {
 		if q.MCQ == nil || len(q.MCQ.Options) != 3 {
 			t.Errorf("MCQ options not overridden; got %+v", q.MCQ)
 		}
+		if q.MCQ != nil && len(q.MCQ.Options) == 3 {
+			for i, want := range []bool{true, false, false} {
+				if got := q.MCQ.Options[i].IsCorrect; got != want {
+					t.Errorf("persisted option %d IsCorrect = %t; want %t", i, got, want)
+				}
+			}
+		}
 	}
 }
 
