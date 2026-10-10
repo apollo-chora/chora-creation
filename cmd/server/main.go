@@ -96,10 +96,12 @@ const (
 	// defaultTopicClassifierModel — the logical model the CHO-2142 topic
 	// classifier requests from chora-model-gateway when
 	// CHORA_TOPIC_CLASSIFIER_MODEL is unset. Topic classification is a short,
-	// structured-output task; flash is sufficient and cheap (it is also the
-	// gateway's DefaultGroundedModel). The gateway's policy loader may still
-	// resolve a different model — it owns the final routing decision.
-	defaultTopicClassifierModel = "gemini-2.5-flash"
+	// structured-output task, but all text generation now routes through the
+	// platform's single text-generation route (LongCat-2.5-Preview); the old
+	// HIGH/CHEAP tiering collapsed to this one model under the single-provider
+	// deployment. The gateway's policy loader may still resolve a different
+	// model — it owns the final routing decision.
+	defaultTopicClassifierModel = "longcat-2.5-preview"
 )
 
 func main() {
