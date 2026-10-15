@@ -92,15 +92,6 @@ func buildSharingReuseClient() *clients.SharingReuseClient {
 const (
 	serviceName = "chora-creation"
 	version     = "0.1.0"
-
-	// defaultTopicClassifierModel — the logical model the CHO-2142 topic
-	// classifier requests from chora-model-gateway when
-	// CHORA_TOPIC_CLASSIFIER_MODEL is unset. Topic classification is a short,
-	// structured-output task and longcat-2.5-preview is the deployment's only
-	// text route (it is also the gateway's DefaultGroundedModel). The gateway's
-	// policy loader may still resolve a different model — it owns the final
-	// routing decision.
-	defaultTopicClassifierModel = "longcat-2.5-preview"
 )
 
 func main() {
@@ -887,7 +878,10 @@ func main() {
 	if gwTarget := strings.TrimSpace(os.Getenv("CHORA_MODEL_GATEWAY_GRPC_URL")); gwTarget != "" {
 		gwModel := strings.TrimSpace(os.Getenv("CHORA_TOPIC_CLASSIFIER_MODEL"))
 		if gwModel == "" {
-			gwModel = defaultTopicClassifierModel
+			// Required, no fallback: a hardcoded default model name would
+			// silently pin routing the operator never chose. Fail boot loud,
+			// naming the var.
+			log.Fatalf("creation: CHORA_TOPIC_CLASSIFIER_MODEL is required when CHORA_MODEL_GATEWAY_GRPC_URL is set (no default classifier model)")
 		}
 		tc, tcErr := clients.NewTopicClassifierGatewayClient(gwTarget, gwModel, 0)
 		if tcErr != nil {
