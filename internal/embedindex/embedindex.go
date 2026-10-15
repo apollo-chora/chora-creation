@@ -1,8 +1,8 @@
 // Package embedindex — the atom-embedding indexer (Epic-1b W4).
 //
 // Composes an atom's text (title + stem + body, capped), embeds it
-// (text-embedding-004, 1024-d — the SAME space chora-consumption mints
-// Growth-Edge concept vectors in), and upserts atom_embeddings. Two drivers:
+// (1024-d — the SAME space chora-consumption mints Growth-Edge concept vectors
+// in), and upserts atom_embeddings. Two drivers:
 //
 //   - publish-time: the publish handler fires IndexAtom asynchronously after
 //     the DRAFT→PUBLISHED save (soft-fail — publishing never blocks on Vertex);

@@ -36,16 +36,21 @@ func (f *fakeAtomEmbedGRPC) Embed(_ context.Context, in *mgv1.EmbedRequest, _ ..
 	return f.resp, nil
 }
 
+// testEmbeddingLogicalModel is the env-provided embedding logical model the
+// tests wire through EMBEDDING_LOGICAL_MODEL_ID.
+const testEmbeddingLogicalModel = "test-embedding-logical-model"
+
 func okAtomEmbedResponse() *mgv1.EmbedResponse {
 	return &mgv1.EmbedResponse{
 		InvocationId: "0198f000-0000-7000-8000-000000000002",
 		Values:       []float32{0.5, -0.25},
 		Vendor:       "vertex_ai_gemini",
-		ModelVersion: "text-embedding-004",
+		ModelVersion: "embedding-route-v1",
 	}
 }
 
 func TestGatewayAtomEmbeddingClient_SendsWireCompleteRequest(t *testing.T) {
+	t.Setenv("EMBEDDING_LOGICAL_MODEL_ID", testEmbeddingLogicalModel)
 	fake := &fakeAtomEmbedGRPC{resp: okAtomEmbedResponse()}
 	c := NewGatewayAtomEmbeddingClientFromStub(fake, 0)
 
@@ -81,8 +86,8 @@ func TestGatewayAtomEmbeddingClient_SendsWireCompleteRequest(t *testing.T) {
 	if req.GetTaskType() != "RETRIEVAL_DOCUMENT" {
 		t.Errorf("task_type = %q (atoms are the DOCUMENT side)", req.GetTaskType())
 	}
-	if req.GetLogicalModelId() != "text-embedding-004" {
-		t.Errorf("logical_model_id = %q (must be pinned, not empty)", req.GetLogicalModelId())
+	if req.GetLogicalModelId() != testEmbeddingLogicalModel {
+		t.Errorf("logical_model_id = %q (must carry the configured EMBEDDING_LOGICAL_MODEL_ID)", req.GetLogicalModelId())
 	}
 	if req.GetOutputDimensions() != 1024 {
 		t.Errorf("output_dimensions = %d (must match the vector(1024) column)", req.GetOutputDimensions())
@@ -96,6 +101,7 @@ func TestGatewayAtomEmbeddingClient_SendsWireCompleteRequest(t *testing.T) {
 }
 
 func TestGatewayAtomEmbeddingClient_Refusals(t *testing.T) {
+	t.Setenv("EMBEDDING_LOGICAL_MODEL_ID", testEmbeddingLogicalModel)
 	cases := []struct {
 		name                 string
 		tenantID, gcid, text string
@@ -127,6 +133,7 @@ func TestGatewayAtomEmbeddingClient_Refusals(t *testing.T) {
 }
 
 func TestGatewayAtomEmbeddingClient_MapsRPCErrorsToEngineSentinels(t *testing.T) {
+	t.Setenv("EMBEDDING_LOGICAL_MODEL_ID", testEmbeddingLogicalModel)
 	cases := []struct {
 		name string
 		rpc  error
@@ -152,6 +159,7 @@ func TestGatewayAtomEmbeddingClient_MapsRPCErrorsToEngineSentinels(t *testing.T)
 }
 
 func TestGatewayAtomEmbeddingClient_EmptyOrNilResponseIsLoud(t *testing.T) {
+	t.Setenv("EMBEDDING_LOGICAL_MODEL_ID", testEmbeddingLogicalModel)
 	for _, resp := range []*mgv1.EmbedResponse{nil, {InvocationId: "x"}} {
 		fake := &fakeAtomEmbedGRPC{resp: resp}
 		c := NewGatewayAtomEmbeddingClientFromStub(fake, 0)
@@ -165,10 +173,11 @@ func TestGatewayAtomEmbeddingClient_EmptyOrNilResponseIsLoud(t *testing.T) {
 	}
 }
 
-func TestGatewayAtomEmbeddingClient_ModelIDIsPinnedConstant(t *testing.T) {
+func TestGatewayAtomEmbeddingClient_ModelIDFromEnv(t *testing.T) {
+	t.Setenv("EMBEDDING_LOGICAL_MODEL_ID", testEmbeddingLogicalModel)
 	c := NewGatewayAtomEmbeddingClientFromStub(&fakeAtomEmbedGRPC{resp: okAtomEmbedResponse()}, 0)
-	if got := c.ModelID(); got != "text-embedding-004" {
-		t.Fatalf("ModelID() = %q", got)
+	if got := c.ModelID(); got != testEmbeddingLogicalModel {
+		t.Fatalf("ModelID() = %q, want the env-provided %q", got, testEmbeddingLogicalModel)
 	}
 }
 
@@ -177,5 +186,14 @@ func TestNewGatewayAtomEmbeddingClient_EmptyTargetFailsLoud(t *testing.T) {
 		t.Fatal("expected constructor error on empty target")
 	} else if !strings.Contains(err.Error(), "CHORA_MODEL_GATEWAY_GRPC_URL") {
 		t.Fatalf("error must name the env var to set: %v", err)
+	}
+}
+
+func TestNewGatewayAtomEmbeddingClient_EmptyModelFailsLoud(t *testing.T) {
+	// No fallback literal: an unset EMBEDDING_LOGICAL_MODEL_ID must refuse to
+	// construct rather than embed under an unnamed model.
+	t.Setenv("EMBEDDING_LOGICAL_MODEL_ID", "")
+	if _, err := NewGatewayAtomEmbeddingClient("gateway:9090", 0); !errors.Is(err, ErrAtomEmbedEmptyLogicalModelID) {
+		t.Fatalf("want ErrAtomEmbedEmptyLogicalModelID, got %v", err)
 	}
 }

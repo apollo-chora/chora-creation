@@ -10,6 +10,10 @@
 //	  same chokepoint (G1' gap 1, every embedding lands a ledger row).
 //	  Unset: indexer NOT wired (publish skips the embed step;
 //	  SearchEmbeddings still serves whatever rows exist).
+//	EMBEDDING_LOGICAL_MODEL_ID      - the gateway embedding logical model the
+//	  indexer requests (shared with chora-consumption). REQUIRED once the
+//	  indexer is wired: a blank value fails boot loud rather than embed under
+//	  an unnamed model.
 //	ATOM_EMBEDDING_BACKFILL_TENANTS - CSV of tenant UUIDs to backfill at
 //	  boot. RLS (NOBYPASSRLS app role) forbids a cross-tenant scan, so the
 //	  operator names the tenants explicitly. Unset: no backfill.
@@ -39,6 +43,12 @@ func buildAtomEmbedIndexer(_ context.Context, repo *creationpg.AtomEmbeddingRepo
 	if target == "" {
 		log.Printf("creation: atom embed indexer NOT wired (CHORA_MODEL_GATEWAY_GRPC_URL unset)")
 		return nil
+	}
+	// Required, no fallback: an unset embedding logical model would mint atom
+	// vectors in an unnamed space that chora-consumption's queries could not
+	// match. Fail boot loud, naming the var.
+	if strings.TrimSpace(os.Getenv("EMBEDDING_LOGICAL_MODEL_ID")) == "" {
+		log.Fatalf("creation: EMBEDDING_LOGICAL_MODEL_ID is required to wire the atom embed indexer (no default embedding model)")
 	}
 	embedder, err := clients.NewGatewayAtomEmbeddingClient(target, 0)
 	if err != nil {
