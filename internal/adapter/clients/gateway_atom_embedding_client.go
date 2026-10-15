@@ -13,11 +13,13 @@
 // CHORA_MODEL_GATEWAY_GRPC_URL, the sidecar does mTLS, grpc.NewClient lazy
 // dial, a minimal private client seam for tests.
 //
-// The logical model is PINNED client-side ("text-embedding-004", the same
-// space consumption mints Growth-Edge vectors in; both sides MUST share one
-// space for cosine search to mean anything) and ModelID() returns the same
-// constant, so the atom_embeddings.model_id label can never drift from what
-// was requested. 1024-d matches the vector(1024) column, sent explicitly.
+// The logical model comes from env EMBEDDING_LOGICAL_MODEL_ID (the same space
+// consumption mints Growth-Edge vectors in; both sides MUST share one space for
+// cosine search to mean anything) and ModelID() returns the same value, so the
+// atom_embeddings.model_id label can never drift from what was requested. The
+// var is REQUIRED — construction fails loud when it is unset, never embedding
+// under an unnamed model. 1024-d matches the vector(1024) column, sent
+// explicitly.
 //
 // Error contract: parity with the retired AtomEmbeddingClient, the same
 // agentengine sentinels, so the publish path's soft-fail and the backfill's
@@ -50,6 +52,13 @@ import (
 var ErrAtomEmbedEmptyTarget = errors.New(
 	"gateway_atom_embedding_client: target empty (set CHORA_MODEL_GATEWAY_GRPC_URL)")
 
+// ErrAtomEmbedEmptyLogicalModelID fails construction when the embedding logical
+// model id is unset. There is deliberately NO fallback literal: an unnamed
+// embedding space would silently diverge from chora-consumption's, so the
+// caller must name it via EMBEDDING_LOGICAL_MODEL_ID.
+var ErrAtomEmbedEmptyLogicalModelID = errors.New(
+	"gateway_atom_embedding_client: EMBEDDING_LOGICAL_MODEL_ID is required")
+
 const (
 	// atomEmbedDefaultTimeout bounds one embedding round-trip; embeds are fast
 	// single-vector calls.
@@ -63,17 +72,12 @@ const (
 	// creation-to-gateway caller.
 	atomEmbedCrewKind = "content_creation"
 
-	// atomEmbedDefaultLogicalModelID is the default embedding model requested
-	// on the wire. Override with EMBEDDING_LOGICAL_MODEL_ID.
-	atomEmbedDefaultLogicalModelID = "text-embedding-004"
-
 	// atomEmbedTaskTypeDocument: atoms are the DOCUMENT side of the retrieval
 	// pair (consumption embeds queries on its side).
 	atomEmbedTaskTypeDocument = "RETRIEVAL_DOCUMENT"
 
-	// atomEmbedOutputDimensions matches atom_embeddings vector(1024) — the
-	// LiquidAI LFM2.5 embedding route's native width (see the registry's
-	// `text-embedding-004` entry). Sent explicitly, never left to a remote
+	// atomEmbedOutputDimensions matches atom_embeddings vector(1024), the
+	// embedding route's native width. Sent explicitly, never left to a remote
 	// default.
 	atomEmbedOutputDimensions = 1024
 )
@@ -92,21 +96,22 @@ type GatewayAtomEmbeddingClient struct {
 	modelID string
 }
 
-// NewGatewayAtomEmbeddingClient dials the gateway at the mesh target. An
-// empty target fails loud. grpc.NewClient is lazy: a healthy return does not
-// prove reachability; the first RPC surfaces Unavailable, which the publish
-// path soft-fails and the backfill records loudly.
+// NewGatewayAtomEmbeddingClient dials the gateway at the mesh target. An empty
+// target or unset EMBEDDING_LOGICAL_MODEL_ID fails loud. grpc.NewClient is
+// lazy: a healthy return does not prove reachability; the first RPC surfaces
+// Unavailable, which the publish path soft-fails and the backfill records
+// loudly.
 func NewGatewayAtomEmbeddingClient(target string, timeout time.Duration) (*GatewayAtomEmbeddingClient, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return nil, ErrAtomEmbedEmptyTarget
 	}
-	if timeout <= 0 {
-		timeout = atomEmbedDefaultTimeout
-	}
 	modelID := strings.TrimSpace(os.Getenv("EMBEDDING_LOGICAL_MODEL_ID"))
 	if modelID == "" {
-		modelID = atomEmbedDefaultLogicalModelID
+		return nil, ErrAtomEmbedEmptyLogicalModelID
+	}
+	if timeout <= 0 {
+		timeout = atomEmbedDefaultTimeout
 	}
 	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -116,15 +121,16 @@ func NewGatewayAtomEmbeddingClient(target string, timeout time.Duration) (*Gatew
 }
 
 // NewGatewayAtomEmbeddingClientFromStub injects a fake gRPC client (tests).
+// The logical model still comes from EMBEDDING_LOGICAL_MODEL_ID.
 func NewGatewayAtomEmbeddingClientFromStub(stub atomEmbedGRPC, timeout time.Duration) *GatewayAtomEmbeddingClient {
 	if timeout <= 0 {
 		timeout = atomEmbedDefaultTimeout
 	}
-	modelID := strings.TrimSpace(os.Getenv("EMBEDDING_LOGICAL_MODEL_ID"))
-	if modelID == "" {
-		modelID = atomEmbedDefaultLogicalModelID
+	return &GatewayAtomEmbeddingClient{
+		client:  stub,
+		timeout: timeout,
+		modelID: strings.TrimSpace(os.Getenv("EMBEDDING_LOGICAL_MODEL_ID")),
 	}
-	return &GatewayAtomEmbeddingClient{client: stub, timeout: timeout, modelID: modelID}
 }
 
 // ModelID reports the logical embedding model for the

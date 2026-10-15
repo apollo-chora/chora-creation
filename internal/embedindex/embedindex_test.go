@@ -11,6 +11,10 @@ import (
 	"testing"
 )
 
+// testEmbeddingModelID is the embedder model id the fake reports; embedindex
+// stamps whatever the embedder's ModelID() returns onto the store upsert.
+const testEmbeddingModelID = "test-embedding-model"
+
 type embedCall struct {
 	TenantID, GCID, Text string
 }
@@ -28,7 +32,7 @@ func (f *fakeEmbedder) Embed(_ context.Context, tenantID, gcid, text string) ([]
 	}
 	return f.vec, nil
 }
-func (f *fakeEmbedder) ModelID() string { return "text-embedding-004" }
+func (f *fakeEmbedder) ModelID() string { return testEmbeddingModelID }
 
 type upsertCall struct {
 	TenantID, AtomID, ModelID string
@@ -78,7 +82,7 @@ func TestIndexAtom_EmbedsComposedTextAndUpserts(t *testing.T) {
 			t.Errorf("composed text missing %q: %q", want, call.Text)
 		}
 	}
-	if len(store.upserts) != 1 || store.upserts[0].AtomID != "atom-1" || store.upserts[0].ModelID != "text-embedding-004" {
+	if len(store.upserts) != 1 || store.upserts[0].AtomID != "atom-1" || store.upserts[0].ModelID != testEmbeddingModelID {
 		t.Fatalf("upserts = %+v", store.upserts)
 	}
 }

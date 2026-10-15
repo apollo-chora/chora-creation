@@ -28,9 +28,13 @@ func (f *fakeGateway) Invoke(_ context.Context, in *mgv1.InvokeRequest, _ ...grp
 	return &mgv1.InvokeResponse{Completion: f.resp}, nil
 }
 
+// testTopicClassifierModel stands in for the operator-provided
+// CHORA_TOPIC_CLASSIFIER_MODEL value threaded into the client by the wiring.
+const testTopicClassifierModel = "test-topic-classifier-model"
+
 func newClient(t *testing.T, g *fakeGateway) *clients.TopicClassifierGatewayClient {
 	t.Helper()
-	c, err := clients.NewTopicClassifierGatewayClientWithStub(g, "gemini-2.5-flash", 0)
+	c, err := clients.NewTopicClassifierGatewayClientWithStub(g, testTopicClassifierModel, 0)
 	if err != nil {
 		t.Fatalf("NewTopicClassifierGatewayClientWithStub: %v", err)
 	}
@@ -105,7 +109,7 @@ func TestClassifyTopics_StampsGatewayEnvelope(t *testing.T) {
 	if in.GetAgentId() == "" || in.GetCrewKind() == "" {
 		t.Fatal("agent_id + crew_kind must be stamped (gateway policy + Armor tier key on agent_id)")
 	}
-	if in.GetLogicalModelId() != "gemini-2.5-flash" {
+	if in.GetLogicalModelId() != testTopicClassifierModel {
 		t.Fatalf("logical_model_id not stamped: %q", in.GetLogicalModelId())
 	}
 	if in.GetInvocationId() == "" {
@@ -157,7 +161,7 @@ func TestClassifyTopics_EmptyJSONArrayFailsLoud(t *testing.T) {
 func TestNewTopicClassifierGatewayClient_EmptyTargetFailsLoud(t *testing.T) {
 	// no-inline-config: a missing CHORA_MODEL_GATEWAY_GRPC_URL must fail loud,
 	// never degrade to a no-op classifier.
-	if _, err := clients.NewTopicClassifierGatewayClient("", "gemini-2.5-flash", 0); !errors.Is(err, clients.ErrTopicClassifierEmptyTarget) {
+	if _, err := clients.NewTopicClassifierGatewayClient("", testTopicClassifierModel, 0); !errors.Is(err, clients.ErrTopicClassifierEmptyTarget) {
 		t.Fatalf("want ErrTopicClassifierEmptyTarget, got %v", err)
 	}
 }
