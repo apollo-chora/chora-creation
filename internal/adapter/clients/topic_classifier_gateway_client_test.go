@@ -212,6 +212,54 @@ func TestNewTopicClassifierGatewayClient_EmptyTargetFailsLoud(t *testing.T) {
 	}
 }
 
+// A refusal is the gateway declining to answer. Dropping it silently would
+// parse a truncated answer as a complete one.
+func TestClassifyTopics_RefusalFailsLoud(t *testing.T) {
+	g := &refusingGateway{}
+	c, err := clients.NewTopicClassifierGatewayClientWithStub(g, 0)
+	if err != nil {
+		t.Fatalf("stub: %v", err)
+	}
+	if _, err := c.ClassifyTopics(context.Background(), req()); err == nil {
+		t.Fatal("want loud error on a refusal, got nil")
+	}
+}
+
+type refusingGateway struct{}
+
+func (r *refusingGateway) Invoke(_ context.Context, _ *gatewayv1.InvokeRequest, _ ...grpc.CallOption) (*gatewayv1.InvokeResponse, error) {
+	return &gatewayv1.InvokeResponse{
+		FinishReason: gatewayv1.FinishReason_FINISH_REASON_STOP,
+		Output: []*gatewayv1.OutputItem{{
+			Item: &gatewayv1.OutputItem_Content{Content: &gatewayv1.ContentPart{
+				Part: &gatewayv1.ContentPart_Refusal{Refusal: &gatewayv1.RefusalPart{Text: "not allowed"}},
+			}},
+		}},
+	}, nil
+}
+
+// An existing traceparent must not suppress a tracestate the caller supplied:
+// the two halves of the W3C context are decided independently.
+func TestClassifyTopics_PreservesExistingParentAndAddsState(t *testing.T) {
+	g := &fakeGateway{resp: `["fractions"]`}
+	c, err := clients.NewTopicClassifierGatewayClientWithStub(g, 0)
+	if err != nil {
+		t.Fatalf("stub: %v", err)
+	}
+	r := req()
+	r.TraceState = "congo=t61rcWkgMzE"
+	ctx := metadata.AppendToOutgoingContext(context.Background(), "traceparent", "00-aaaa-bbbb-01")
+	if _, err := c.ClassifyTopics(ctx, r); err != nil {
+		t.Fatalf("ClassifyTopics: %v", err)
+	}
+	if got := g.md.Get("traceparent"); len(got) != 1 || got[0] != "00-aaaa-bbbb-01" {
+		t.Errorf("traceparent = %v, want the existing value only", got)
+	}
+	if got := g.md.Get("tracestate"); len(got) != 1 || got[0] != "congo=t61rcWkgMzE" {
+		t.Errorf("tracestate = %v, want the caller's value", got)
+	}
+}
+
 // The port contract must be satisfied — a compile-time assertion in test form.
 func TestTopicClassifierGatewayClient_ImplementsPort(t *testing.T) {
 	var _ atom.TopicClassifier = (*clients.TopicClassifierGatewayClient)(nil)

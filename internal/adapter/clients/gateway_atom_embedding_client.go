@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -151,35 +152,60 @@ func (c *GatewayAtomEmbeddingClient) Embed(ctx context.Context, tenantID, gcid, 
 	resp, err := c.client.Embed(withTraceparent(callCtx), &gatewayv1.EmbedRequest{
 		Input:        []string{text},
 		Dimensions:   proto.Int32(atomEmbedOutputDimensions),
-		User:         gcid,
-		MetadataJson: []byte(fmt.Sprintf(`{"crew_kind":%q,"task_type":%q}`, atomEmbedCrewKind, atomEmbedTaskTypeDocument)),
+		User: gcid,
+		// crew_kind and task_type have no EmbedRequest field. Marshalled rather
+		// than hand-built so the payload cannot be malformed.
+		MetadataJson: mustJSON(map[string]string{
+			"crew_kind": atomEmbedCrewKind,
+			"task_type": atomEmbedTaskTypeDocument,
+		}),
 	})
 	if err != nil {
 		return nil, "", mapAtomEmbedRPCError(err)
 	}
-	vec, err := firstVector(resp)
+	vec, model, err := firstVector(resp)
 	if err != nil {
 		return nil, "", err
 	}
-	return vec, resp.GetUpstreamModel(), nil
+	return vec, model, nil
 }
 
-// firstVector returns the response's first vector, converted to float32 —
-// the protobuf field is float64, the embedindex port is float32.
-func firstVector(resp *gatewayv1.EmbedResponse) ([]float32, error) {
+// firstVector returns the response's vector for input index 0, converted to
+// float32 — the protobuf field is float64, the embedindex port is float32.
+//
+// atom_embeddings is a fixed-width vector(1024) column, so a vector of the
+// wrong width is refused here rather than reaching the write path. A missing
+// or blank upstream model is refused too: stamping a vector with no model name
+// would make the column a lie about what produced it.
+func firstVector(resp *gatewayv1.EmbedResponse) ([]float32, string, error) {
 	if resp == nil {
-		return nil, fmt.Errorf("%w: empty embedding response from gateway", agentengine.ErrStreamAborted)
+		return nil, "", fmt.Errorf("%w: empty embedding response from gateway", agentengine.ErrStreamAborted)
+	}
+	model := strings.TrimSpace(resp.GetUpstreamModel())
+	if model == "" {
+		return nil, "", fmt.Errorf("%w: gateway did not report which model answered", agentengine.ErrStreamAborted)
 	}
 	data := resp.GetData()
 	if len(data) == 0 {
-		return nil, fmt.Errorf("%w: empty embedding response from gateway", agentengine.ErrStreamAborted)
+		return nil, "", fmt.Errorf("%w: empty embedding response from gateway", agentengine.ErrStreamAborted)
+	}
+	// The gateway places each vector at the index the caller's input holds, so
+	// index 0 is the single text this call sent.
+	if data[0].GetIndex() != 0 {
+		return nil, "", fmt.Errorf("%w: gateway returned a vector for input index %d, want 0", agentengine.ErrStreamAborted, data[0].GetIndex())
 	}
 	src := data[0].GetEmbedding()
+	if len(src) != atomEmbedOutputDimensions {
+		return nil, "", fmt.Errorf("%w: gateway returned %d dimensions, want %d", agentengine.ErrStreamAborted, len(src), atomEmbedOutputDimensions)
+	}
 	out := make([]float32, len(src))
 	for i, v := range src {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, "", fmt.Errorf("%w: gateway returned a non-finite embedding value at %d", agentengine.ErrStreamAborted, i)
+		}
 		out[i] = float32(v)
 	}
-	return out, nil
+	return out, model, nil
 }
 
 // withTraceparent moves the traceparent onto the gRPC metadata. The gateway's
@@ -187,12 +213,17 @@ func firstVector(resp *gatewayv1.EmbedResponse) ([]float32, error) {
 // `traceparent` metadata key, which is where the OTel interceptor reads it.
 //
 // AppendToOutgoingContext appends rather than replaces, so an existing value is
-// left alone rather than sent twice.
+// left alone rather than sent twice, and an empty value is never emitted —
+// empty trace metadata is worse than none.
 func withTraceparent(ctx context.Context) context.Context {
 	if md, ok := metadata.FromOutgoingContext(ctx); ok && len(md.Get("traceparent")) > 0 {
 		return ctx
 	}
-	return metadata.AppendToOutgoingContext(ctx, "traceparent", tracing.TraceparentFromContext(ctx))
+	traceparent := strings.TrimSpace(tracing.TraceparentFromContext(ctx))
+	if traceparent == "" {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, "traceparent", traceparent)
 }
 
 // mapAtomEmbedRPCError translates gRPC status codes onto the canonical

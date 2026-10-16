@@ -173,8 +173,9 @@ func (c *TopicClassifierGatewayClient) ClassifyTopics(ctx context.Context, req a
 				}},
 			}},
 			// crew_kind has no Invoke field; it rides in metadata_json, which
-			// the gateway maps onto the invocation's metadata.
-			MetadataJson: []byte(fmt.Sprintf(`{"crew_kind":%q}`, topicClassifierCrewKind)),
+			// the gateway maps onto the invocation's metadata. Marshalled
+			// rather than hand-built so the payload cannot be malformed.
+			MetadataJson: mustJSON(map[string]string{"crew_kind": topicClassifierCrewKind}),
 		})
 	if err != nil {
 		return nil, fmt.Errorf("topic classify (atom=%s): gateway invoke: %w", req.AtomID, err)
@@ -184,7 +185,11 @@ func (c *TopicClassifierGatewayClient) ClassifyTopics(ctx context.Context, req a
 			req.AtomID, rc, resp.GetRawFinishReason())
 	}
 
-	completion := strings.TrimSpace(mustAnswerText(resp))
+	answer, err := mustAnswerText(resp)
+	if err != nil {
+		return nil, fmt.Errorf("topic classify (atom=%s): %w", req.AtomID, err)
+	}
+	completion := strings.TrimSpace(answer)
 	if completion == "" {
 		return nil, fmt.Errorf("topic classify (atom=%s): gateway returned an empty completion", req.AtomID)
 	}
@@ -230,15 +235,23 @@ func truncate(s string, max int) string {
 // left alone rather than sent twice.
 func withTraceContext(ctx context.Context, traceparent, tracestate string) context.Context {
 	md, _ := metadata.FromOutgoingContext(ctx)
-	if len(md.Get("traceparent")) > 0 {
-		return ctx
-	}
+	haveParent := len(md.Get("traceparent")) > 0
+	haveState := len(md.Get("tracestate")) > 0
+
 	pairs := make([]string, 0, 4)
-	if traceparent = strings.TrimSpace(traceparent); traceparent != "" {
-		pairs = append(pairs, "traceparent", traceparent)
+	// AppendToOutgoingContext appends rather than replaces, so a value already
+	// on the outgoing metadata is left alone rather than sent twice. Each half
+	// is decided independently: an existing parent must not suppress a
+	// tracestate the caller supplied.
+	if !haveParent {
+		if traceparent = strings.TrimSpace(traceparent); traceparent != "" {
+			pairs = append(pairs, "traceparent", traceparent)
+		}
 	}
-	if tracestate = strings.TrimSpace(tracestate); tracestate != "" {
-		pairs = append(pairs, "tracestate", tracestate)
+	if !haveState {
+		if tracestate = strings.TrimSpace(tracestate); tracestate != "" {
+			pairs = append(pairs, "tracestate", tracestate)
+		}
 	}
 	if len(pairs) == 0 {
 		return ctx
@@ -247,22 +260,44 @@ func withTraceContext(ctx context.Context, traceparent, tracestate string) conte
 }
 
 // mustAnswerText flattens the response's output items into the model's answer.
-// A refusal part is the gateway declining to answer, and dropping it silently
-// would parse a truncated answer as a complete one, so it yields "" and the
-// caller reports the empty completion.
-func mustAnswerText(resp *gatewayv1.InvokeResponse) string {
+//
+// Only text is a valid classification. A refusal is the gateway declining to
+// answer, and dropping it silently would parse a truncated answer as a
+// complete one — so anything else is an error rather than something skipped.
+func mustAnswerText(resp *gatewayv1.InvokeResponse) (string, error) {
 	if resp == nil {
-		return ""
+		return "", fmt.Errorf("gateway returned no response")
 	}
 	var b strings.Builder
 	for _, item := range resp.GetOutput() {
 		part := item.GetContent()
-		if part == nil || part.GetText() == nil {
+		if part == nil {
+			if item.GetToolCall() != nil {
+				return "", fmt.Errorf("model emitted a tool call, which is not a topic classification")
+			}
 			continue
 		}
-		b.WriteString(part.GetText().GetText())
+		switch {
+		case part.GetText() != nil:
+			b.WriteString(part.GetText().GetText())
+		case part.GetRefusal() != nil:
+			return "", fmt.Errorf("model refused: %s", part.GetRefusal().GetText())
+		default:
+			return "", fmt.Errorf("model emitted a non-text content part, which is not a topic classification")
+		}
 	}
-	return b.String()
+	return b.String(), nil
+}
+
+// mustJSON marshals caller bookkeeping into the metadata_json payload. It
+// panics on failure: the input is a fixed map of strings, so a failure would be
+// a programming error rather than a condition to handle.
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("clients: marshal metadata: %v", err))
+	}
+	return b
 }
 
 // parseTopicTags extracts the JSON array of tags from a completion. Models

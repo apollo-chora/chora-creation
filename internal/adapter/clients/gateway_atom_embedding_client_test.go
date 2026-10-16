@@ -7,6 +7,7 @@ package clients
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"errors"
 	"strings"
 	"testing"
@@ -41,10 +42,14 @@ func (f *fakeAtomEmbedGRPC) Embed(ctx context.Context, in *gatewayv1.EmbedReques
 }
 
 func okAtomEmbedResponse() *gatewayv1.EmbedResponse {
+	// atom_embeddings is a fixed-width vector(1024) column, so the fixture
+	// carries the full width the client now requires.
+	vec := make([]float64, atomEmbedOutputDimensions)
+	vec[0], vec[1] = 0.5, -0.25
 	return &gatewayv1.EmbedResponse{
 		InvocationId:  "0198f000-0000-7000-8000-000000000002",
 		UpstreamModel: "embedding-route-v1",
-		Data:          []*gatewayv1.Embedding{{Index: 0, Embedding: []float64{0.5, -0.25}}},
+		Data:          []*gatewayv1.Embedding{{Index: 0, Embedding: vec}},
 	}
 }
 
@@ -58,8 +63,8 @@ func TestGatewayAtomEmbeddingClient_SendsWireCompleteRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
-	if len(vec) != 2 || vec[0] != 0.5 {
-		t.Fatalf("vector not passed through, got %v", vec)
+	if len(vec) != atomEmbedOutputDimensions || vec[0] != 0.5 || vec[1] != -0.25 {
+		t.Fatalf("vector not passed through: len=%d first=%v", len(vec), vec[:2])
 	}
 	if model != "embedding-route-v1" {
 		t.Errorf("model = %q, want the upstream model from the response", model)
@@ -168,6 +173,41 @@ func TestGatewayAtomEmbeddingClient_EmptyOrNilResponseIsLoud(t *testing.T) {
 		if !errors.Is(err, agentengine.ErrStreamAborted) {
 			t.Fatalf("want ErrStreamAborted, got %v", err)
 		}
+	}
+}
+
+// atom_embeddings is a fixed-width vector(1024) column, so a vector of the
+// wrong width must be refused before it reaches the write path.
+func TestGatewayAtomEmbeddingClient_RejectsMalformedVectors(t *testing.T) {
+	short := okAtomEmbedResponse()
+	short.Data[0].Embedding = short.Data[0].Embedding[:8]
+
+	wrongIndex := okAtomEmbedResponse()
+	wrongIndex.Data[0].Index = 3
+
+	noModel := okAtomEmbedResponse()
+	noModel.UpstreamModel = "  "
+
+	nonFinite := okAtomEmbedResponse()
+	nonFinite.Data[0].Embedding[7] = math.Inf(1)
+
+	cases := []struct {
+		name string
+		resp *gatewayv1.EmbedResponse
+	}{
+		{"wrong width", short},
+		{"wrong index", wrongIndex},
+		{"no upstream model", noModel},
+		{"non-finite value", nonFinite},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeAtomEmbedGRPC{resp: tc.resp}
+			c := NewGatewayAtomEmbeddingClientFromStub(fake, 0)
+			if _, _, err := c.Embed(context.Background(), "tenant-1", "author-1", "hello"); err == nil {
+				t.Fatal("expected an error for a malformed embedding response")
+			}
+		})
 	}
 }
 
