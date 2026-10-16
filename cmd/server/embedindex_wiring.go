@@ -13,6 +13,11 @@
 //	ATOM_EMBEDDING_BACKFILL_TENANTS - CSV of tenant UUIDs to backfill at
 //	  boot. RLS (NOBYPASSRLS app role) forbids a cross-tenant scan, so the
 //	  operator names the tenants explicitly. Unset: no backfill.
+//
+// No EMBEDDING_LOGICAL_MODEL_ID: the gateway resolves the embeddings
+// operation from the RPC method, so the caller names no model. The model that
+// answered comes back on the response and is what gets stamped onto
+// atom_embeddings.model_id.
 package main
 
 import (
@@ -45,7 +50,7 @@ func buildAtomEmbedIndexer(_ context.Context, repo *creationpg.AtomEmbeddingRepo
 		log.Printf("creation: atom embed indexer NOT wired (gateway embed client: %v)", err)
 		return nil
 	}
-	log.Printf("creation: atom embed indexer wired via model-gateway (model=%s)", embedder.ModelID())
+	log.Printf("creation: atom embed indexer wired via model-gateway (target=%s)", target)
 	return embedindex.New(embedder, embedStoreAdapter{repo: repo})
 }
 

@@ -1,8 +1,8 @@
 // Package embedindex — the atom-embedding indexer (Epic-1b W4).
 //
 // Composes an atom's text (title + stem + body, capped), embeds it
-// (text-embedding-004, 1024-d — the SAME space chora-consumption mints
-// Growth-Edge concept vectors in), and upserts atom_embeddings. Two drivers:
+// (1024-d — the SAME space chora-consumption mints Growth-Edge concept vectors
+// in), and upserts atom_embeddings. Two drivers:
 //
 //   - publish-time: the publish handler fires IndexAtom asynchronously after
 //     the DRAFT→PUBLISHED save (soft-fail — publishing never blocks on Vertex);
@@ -38,9 +38,12 @@ type Atom struct {
 // explicitly (creation never stamps tracing ctx keys): the gateway refuses an
 // unattributed embed, so the port carries the attribution rather than hoping
 // the ctx does.
+//
+// The model is returned with the vector rather than read from a separate
+// accessor: the gateway resolves which model serves the embeddings operation,
+// so the only model name worth stamping is the one that actually answered.
 type Embedder interface {
-	Embed(ctx context.Context, tenantID, gcid, text string) ([]float32, error)
-	ModelID() string
+	Embed(ctx context.Context, tenantID, gcid, text string) (embedding []float32, modelID string, err error)
 }
 
 // Store persists embeddings + lists backfill candidates.
@@ -68,11 +71,11 @@ func (s *Service) IndexAtom(ctx context.Context, tenantID, actorGCID, atomID, ti
 	if text == "" {
 		return nil
 	}
-	vec, err := s.embedder.Embed(ctx, tenantID, actorGCID, text)
+	vec, modelID, err := s.embedder.Embed(ctx, tenantID, actorGCID, text)
 	if err != nil {
 		return fmt.Errorf("embedindex: embed atom %s: %w", atomID, err)
 	}
-	if err := s.store.Upsert(ctx, tenantID, atomID, vec, s.embedder.ModelID()); err != nil {
+	if err := s.store.Upsert(ctx, tenantID, atomID, vec, modelID); err != nil {
 		return fmt.Errorf("embedindex: upsert atom %s: %w", atomID, err)
 	}
 	return nil

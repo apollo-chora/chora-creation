@@ -6,42 +6,50 @@ package clients
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"errors"
 	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-
-	mgv1 "github.com/apollo-chora/chora-contracts/gen/go/chora/services/model_gateway/v1"
 
 	"github.com/apollo-chora/chora-common/agentengine"
 	"github.com/apollo-chora/chora-common/tracing"
+
+	gatewayv1 "github.com/apollo-chora/chora-creation/internal/adapter/clients/gatewayv1"
 )
 
 type fakeAtomEmbedGRPC struct {
-	lastReq *mgv1.EmbedRequest
+	lastReq *gatewayv1.EmbedRequest
+	lastMD  metadata.MD
 	calls   int
-	resp    *mgv1.EmbedResponse
+	resp    *gatewayv1.EmbedResponse
 	err     error
 }
 
-func (f *fakeAtomEmbedGRPC) Embed(_ context.Context, in *mgv1.EmbedRequest, _ ...grpc.CallOption) (*mgv1.EmbedResponse, error) {
+func (f *fakeAtomEmbedGRPC) Embed(ctx context.Context, in *gatewayv1.EmbedRequest, _ ...grpc.CallOption) (*gatewayv1.EmbedResponse, error) {
 	f.calls++
 	f.lastReq = in
+	f.lastMD, _ = metadata.FromOutgoingContext(ctx)
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.resp, nil
 }
 
-func okAtomEmbedResponse() *mgv1.EmbedResponse {
-	return &mgv1.EmbedResponse{
-		InvocationId: "0198f000-0000-7000-8000-000000000002",
-		Values:       []float32{0.5, -0.25},
-		Vendor:       "vertex_ai_gemini",
-		ModelVersion: "text-embedding-004",
+func okAtomEmbedResponse() *gatewayv1.EmbedResponse {
+	// atom_embeddings is a fixed-width vector(1024) column, so the fixture
+	// carries the full width the client now requires.
+	vec := make([]float64, atomEmbedOutputDimensions)
+	vec[0], vec[1] = 0.5, -0.25
+	return &gatewayv1.EmbedResponse{
+		InvocationId:  "0198f000-0000-7000-8000-000000000002",
+		UpstreamModel: "embedding-route-v1",
+		Data:          []*gatewayv1.Embedding{{Index: 0, Embedding: vec}},
 	}
 }
 
@@ -51,47 +59,50 @@ func TestGatewayAtomEmbeddingClient_SendsWireCompleteRequest(t *testing.T) {
 
 	ctx := tracing.WithTraceparent(context.Background(),
 		"00-33333333333333333333333333333333-4444444444444444-01")
-	got, err := c.Embed(ctx, "tenant-1", "author-gcid-1", "Fractions I\nWhat is 1/2 + 1/4?")
+	vec, model, err := c.Embed(ctx, "tenant-1", "author-gcid-1", "Fractions I\nWhat is 1/2 + 1/4?")
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
-	if len(got) != 2 || got[0] != 0.5 {
-		t.Fatalf("values not passed through, got %v", got)
+	if len(vec) != atomEmbedOutputDimensions || vec[0] != 0.5 || vec[1] != -0.25 {
+		t.Fatalf("vector not passed through: len=%d first=%v", len(vec), vec[:2])
+	}
+	if model != "embedding-route-v1" {
+		t.Errorf("model = %q, want the upstream model from the response", model)
 	}
 	if fake.calls != 1 {
 		t.Fatalf("expected exactly 1 RPC, got %d", fake.calls)
 	}
 
 	req := fake.lastReq
-	if req.GetTenantId() != "tenant-1" {
-		t.Errorf("tenant_id = %q", req.GetTenantId())
+	// The gateway's EmbedRequest claims no tenant, gcid or agent: the
+	// credential is the tenant, so the caller sends none. The author's gcid
+	// rides in `user`, the one identity-shaped field the request has.
+	if req.GetUser() != "author-gcid-1" {
+		t.Errorf("user = %q (must be the atom's author)", req.GetUser())
 	}
-	if req.GetGcid() != "author-gcid-1" {
-		t.Errorf("gcid = %q (must be the atom's author)", req.GetGcid())
+	if len(req.GetInput()) != 1 || req.GetInput()[0] != "Fractions I\nWhat is 1/2 + 1/4?" {
+		t.Errorf("input = %q", req.GetInput())
 	}
-	if req.GetAgentId() != "creation_atom_embedder" {
-		t.Errorf("agent_id = %q", req.GetAgentId())
+	if req.GetDimensions() != 1024 {
+		t.Errorf("dimensions = %d (must match the vector(1024) column)", req.GetDimensions())
 	}
-	if req.GetCrewKind() != "content_creation" {
-		t.Errorf("crew_kind = %q (mirror the topic classifier)", req.GetCrewKind())
+
+	// crew_kind and task_type have no EmbedRequest field; both ride in
+	// metadata_json, which the gateway maps onto the invocation's metadata.
+	var meta map[string]any
+	if err := json.Unmarshal(req.GetMetadataJson(), &meta); err != nil {
+		t.Fatalf("metadata_json is not valid JSON: %v (bytes: %q)", err, req.GetMetadataJson())
 	}
-	if req.GetText() != "Fractions I\nWhat is 1/2 + 1/4?" {
-		t.Errorf("text = %q", req.GetText())
+	if meta["crew_kind"] != "content_creation" {
+		t.Errorf("crew_kind = %v", meta["crew_kind"])
 	}
-	if req.GetTaskType() != "RETRIEVAL_DOCUMENT" {
-		t.Errorf("task_type = %q (atoms are the DOCUMENT side)", req.GetTaskType())
+	if meta["task_type"] != "RETRIEVAL_DOCUMENT" {
+		t.Errorf("task_type = %v (atoms are the DOCUMENT side)", meta["task_type"])
 	}
-	if req.GetLogicalModelId() != "text-embedding-004" {
-		t.Errorf("logical_model_id = %q (must be pinned, not empty)", req.GetLogicalModelId())
-	}
-	if req.GetOutputDimensions() != 1024 {
-		t.Errorf("output_dimensions = %d (must match the vector(1024) column)", req.GetOutputDimensions())
-	}
-	if strings.TrimSpace(req.GetInvocationId()) == "" {
-		t.Errorf("invocation_id empty; ledger idempotency requires a caller UUIDv7")
-	}
-	if req.GetTraceparent() != "00-33333333333333333333333333333333-4444444444444444-01" {
-		t.Errorf("traceparent = %q", req.GetTraceparent())
+
+	// traceparent has no EmbedRequest field; it travels as gRPC metadata.
+	if got := fake.lastMD.Get("traceparent"); len(got) != 1 || got[0] != "00-33333333333333333333333333333333-4444444444444444-01" {
+		t.Errorf("traceparent metadata = %v", got)
 	}
 }
 
@@ -109,7 +120,7 @@ func TestGatewayAtomEmbeddingClient_Refusals(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeAtomEmbedGRPC{resp: okAtomEmbedResponse()}
 			c := NewGatewayAtomEmbeddingClientFromStub(fake, 0)
-			_, err := c.Embed(context.Background(), tc.tenantID, tc.gcid, tc.text)
+			_, _, err := c.Embed(context.Background(), tc.tenantID, tc.gcid, tc.text)
 			if err == nil {
 				t.Fatal("expected refusal")
 			}
@@ -140,7 +151,7 @@ func TestGatewayAtomEmbeddingClient_MapsRPCErrorsToEngineSentinels(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeAtomEmbedGRPC{err: tc.rpc}
 			c := NewGatewayAtomEmbeddingClientFromStub(fake, 0)
-			_, err := c.Embed(context.Background(), "tenant-1", "author-1", "hello")
+			_, _, err := c.Embed(context.Background(), "tenant-1", "author-1", "hello")
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -152,10 +163,10 @@ func TestGatewayAtomEmbeddingClient_MapsRPCErrorsToEngineSentinels(t *testing.T)
 }
 
 func TestGatewayAtomEmbeddingClient_EmptyOrNilResponseIsLoud(t *testing.T) {
-	for _, resp := range []*mgv1.EmbedResponse{nil, {InvocationId: "x"}} {
+	for _, resp := range []*gatewayv1.EmbedResponse{nil, {InvocationId: "x"}} {
 		fake := &fakeAtomEmbedGRPC{resp: resp}
 		c := NewGatewayAtomEmbeddingClientFromStub(fake, 0)
-		_, err := c.Embed(context.Background(), "tenant-1", "author-1", "hello")
+		_, _, err := c.Embed(context.Background(), "tenant-1", "author-1", "hello")
 		if err == nil {
 			t.Fatalf("expected error for resp=%v", resp)
 		}
@@ -165,10 +176,38 @@ func TestGatewayAtomEmbeddingClient_EmptyOrNilResponseIsLoud(t *testing.T) {
 	}
 }
 
-func TestGatewayAtomEmbeddingClient_ModelIDIsPinnedConstant(t *testing.T) {
-	c := NewGatewayAtomEmbeddingClientFromStub(&fakeAtomEmbedGRPC{resp: okAtomEmbedResponse()}, 0)
-	if got := c.ModelID(); got != "text-embedding-004" {
-		t.Fatalf("ModelID() = %q", got)
+// atom_embeddings is a fixed-width vector(1024) column, so a vector of the
+// wrong width must be refused before it reaches the write path.
+func TestGatewayAtomEmbeddingClient_RejectsMalformedVectors(t *testing.T) {
+	short := okAtomEmbedResponse()
+	short.Data[0].Embedding = short.Data[0].Embedding[:8]
+
+	wrongIndex := okAtomEmbedResponse()
+	wrongIndex.Data[0].Index = 3
+
+	noModel := okAtomEmbedResponse()
+	noModel.UpstreamModel = "  "
+
+	nonFinite := okAtomEmbedResponse()
+	nonFinite.Data[0].Embedding[7] = math.Inf(1)
+
+	cases := []struct {
+		name string
+		resp *gatewayv1.EmbedResponse
+	}{
+		{"wrong width", short},
+		{"wrong index", wrongIndex},
+		{"no upstream model", noModel},
+		{"non-finite value", nonFinite},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeAtomEmbedGRPC{resp: tc.resp}
+			c := NewGatewayAtomEmbeddingClientFromStub(fake, 0)
+			if _, _, err := c.Embed(context.Background(), "tenant-1", "author-1", "hello"); err == nil {
+				t.Fatal("expected an error for a malformed embedding response")
+			}
+		})
 	}
 }
 

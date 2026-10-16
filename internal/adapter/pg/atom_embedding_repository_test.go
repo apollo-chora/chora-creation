@@ -81,7 +81,7 @@ func TestAtomEmbeddingUpsert_SQLShapeAndRLS(t *testing.T) {
 	tq := &aeStubTxQuerier{}
 	repo := NewAtomEmbeddingRepositoryFromTxQuerier(tq)
 
-	err := repo.Upsert(context.Background(), "tnt-1", "atom-1", []float32{0.5, -0.25}, "text-embedding-004")
+	err := repo.Upsert(context.Background(), "tnt-1", "atom-1", []float32{0.5, -0.25}, "test-embedding-model")
 	if err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}

@@ -2,35 +2,47 @@ package clients_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
-
-	mgv1 "github.com/apollo-chora/chora-contracts/gen/go/chora/services/model_gateway/v1"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/apollo-chora/chora-creation/internal/adapter/clients"
 	"github.com/apollo-chora/chora-creation/internal/domain/atom"
+
+	gatewayv1 "github.com/apollo-chora/chora-creation/internal/adapter/clients/gatewayv1"
 )
 
 type fakeGateway struct {
-	got  *mgv1.InvokeRequest
+	got  *gatewayv1.InvokeRequest
+	md   metadata.MD
 	resp string
 	err  error
 }
 
-func (f *fakeGateway) Invoke(_ context.Context, in *mgv1.InvokeRequest, _ ...grpc.CallOption) (*mgv1.InvokeResponse, error) {
+func (f *fakeGateway) Invoke(ctx context.Context, in *gatewayv1.InvokeRequest, _ ...grpc.CallOption) (*gatewayv1.InvokeResponse, error) {
 	f.got = in
+	f.md, _ = metadata.FromOutgoingContext(ctx)
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &mgv1.InvokeResponse{Completion: f.resp}, nil
+	return &gatewayv1.InvokeResponse{
+		FinishReason: gatewayv1.FinishReason_FINISH_REASON_STOP,
+		Output: []*gatewayv1.OutputItem{{
+			Item: &gatewayv1.OutputItem_Content{Content: &gatewayv1.ContentPart{
+				Part: &gatewayv1.ContentPart_Text{Text: &gatewayv1.TextPart{Text: f.resp}},
+			}},
+		}},
+	}, nil
 }
 
 func newClient(t *testing.T, g *fakeGateway) *clients.TopicClassifierGatewayClient {
 	t.Helper()
-	c, err := clients.NewTopicClassifierGatewayClientWithStub(g, "gemini-2.5-flash", 0)
+	c, err := clients.NewTopicClassifierGatewayClientWithStub(g, 0)
 	if err != nil {
 		t.Fatalf("NewTopicClassifierGatewayClientWithStub: %v", err)
 	}
@@ -102,26 +114,64 @@ func TestClassifyTopics_StampsGatewayEnvelope(t *testing.T) {
 	if in.GetSurface() != "content_creation" {
 		t.Fatalf("ADR-254 D7: InvokeRequest.surface must be stamped content_creation, got %q", in.GetSurface())
 	}
-	if in.GetAgentId() == "" || in.GetCrewKind() == "" {
-		t.Fatal("agent_id + crew_kind must be stamped (gateway policy + Armor tier key on agent_id)")
+	if in.GetAgentId() == "" {
+		t.Fatal("agent_id must be stamped (gateway policy keys on agent_id)")
 	}
-	if in.GetLogicalModelId() != "gemini-2.5-flash" {
-		t.Fatalf("logical_model_id not stamped: %q", in.GetLogicalModelId())
+	// The gateway resolves the operation from the RPC method, so the caller
+	// sends no model ID.
+	if in.GetModel() != "" {
+		t.Fatalf("model = %q, want empty", in.GetModel())
 	}
 	if in.GetInvocationId() == "" {
 		t.Fatal("invocation_id must be stamped (gateway ledger dedup key)")
 	}
-	// OTLP-everywhere: the caller's span must cross the LLM hop.
-	if in.GetTraceparent() == "" {
-		t.Fatal("traceparent must propagate")
+	// crew_kind has no Invoke field; it rides in metadata_json.
+	var meta map[string]any
+	if err := json.Unmarshal(in.GetMetadataJson(), &meta); err != nil {
+		t.Fatalf("metadata_json is not valid JSON: %v (bytes: %q)", err, in.GetMetadataJson())
 	}
-	// The atom's content must actually reach the prompt.
-	if !strings.Contains(in.GetPrompt(), "Comparing Fractions") {
-		t.Fatalf("atom title missing from prompt: %q", in.GetPrompt())
+	if meta["crew_kind"] != "content_creation" {
+		t.Fatalf("crew_kind = %v", meta["crew_kind"])
 	}
-	if in.GetSystemPrompt() == "" {
-		t.Fatal("system prompt must constrain the output shape")
+	// OTLP-everywhere: the caller's span must cross the LLM hop. The Invoke RPC
+	// has no traceparent field, so it travels as gRPC metadata.
+	if got := g.md.Get("traceparent"); len(got) != 1 || got[0] != req().TraceParent {
+		t.Fatalf("traceparent metadata = %v, want the caller's span", got)
 	}
+	// The atom's content must actually reach the prompt, which is now a user
+	// message rather than a request field.
+	if len(in.GetMessages()) != 1 {
+		t.Fatalf("messages len = %d, want 1", len(in.GetMessages()))
+	}
+	prompt := in.GetMessages()[0].GetContent()[0].GetText().GetText()
+	if !strings.Contains(prompt, "Comparing Fractions") {
+		t.Fatalf("atom title missing from prompt: %q", prompt)
+	}
+	if in.GetSystemInstruction() == "" {
+		t.Fatal("system instruction must constrain the output shape")
+	}
+}
+
+func TestClassifyTopics_NonStopFinishReasonFailsLoud(t *testing.T) {
+	// A truncated answer must not be parsed as a complete one.
+	trunc := &truncatingGateway{}
+	c, err := clients.NewTopicClassifierGatewayClientWithStub(trunc, 0)
+	if err != nil {
+		t.Fatalf("stub: %v", err)
+	}
+	if _, err := c.ClassifyTopics(context.Background(), req()); err == nil {
+		t.Fatal("want loud error on a non-STOP finish reason, got nil")
+	}
+}
+
+// truncatingGateway reports a LENGTH finish reason, i.e. a truncated answer.
+type truncatingGateway struct{}
+
+func (t *truncatingGateway) Invoke(_ context.Context, _ *gatewayv1.InvokeRequest, _ ...grpc.CallOption) (*gatewayv1.InvokeResponse, error) {
+	return &gatewayv1.InvokeResponse{
+		FinishReason:    gatewayv1.FinishReason_FINISH_REASON_LENGTH,
+		RawFinishReason: proto.String("hit ceiling"),
+	}, nil
 }
 
 func TestClassifyTopics_GatewayErrorFailsLoud(t *testing.T) {
@@ -157,14 +207,56 @@ func TestClassifyTopics_EmptyJSONArrayFailsLoud(t *testing.T) {
 func TestNewTopicClassifierGatewayClient_EmptyTargetFailsLoud(t *testing.T) {
 	// no-inline-config: a missing CHORA_MODEL_GATEWAY_GRPC_URL must fail loud,
 	// never degrade to a no-op classifier.
-	if _, err := clients.NewTopicClassifierGatewayClient("", "gemini-2.5-flash", 0); !errors.Is(err, clients.ErrTopicClassifierEmptyTarget) {
+	if _, err := clients.NewTopicClassifierGatewayClient("", 0); !errors.Is(err, clients.ErrTopicClassifierEmptyTarget) {
 		t.Fatalf("want ErrTopicClassifierEmptyTarget, got %v", err)
 	}
 }
 
-func TestNewTopicClassifierGatewayClient_EmptyModelFailsLoud(t *testing.T) {
-	if _, err := clients.NewTopicClassifierGatewayClient("host:9090", "", 0); err == nil {
-		t.Fatal("want loud error on empty logical model id, got nil")
+// A refusal is the gateway declining to answer. Dropping it silently would
+// parse a truncated answer as a complete one.
+func TestClassifyTopics_RefusalFailsLoud(t *testing.T) {
+	g := &refusingGateway{}
+	c, err := clients.NewTopicClassifierGatewayClientWithStub(g, 0)
+	if err != nil {
+		t.Fatalf("stub: %v", err)
+	}
+	if _, err := c.ClassifyTopics(context.Background(), req()); err == nil {
+		t.Fatal("want loud error on a refusal, got nil")
+	}
+}
+
+type refusingGateway struct{}
+
+func (r *refusingGateway) Invoke(_ context.Context, _ *gatewayv1.InvokeRequest, _ ...grpc.CallOption) (*gatewayv1.InvokeResponse, error) {
+	return &gatewayv1.InvokeResponse{
+		FinishReason: gatewayv1.FinishReason_FINISH_REASON_STOP,
+		Output: []*gatewayv1.OutputItem{{
+			Item: &gatewayv1.OutputItem_Content{Content: &gatewayv1.ContentPart{
+				Part: &gatewayv1.ContentPart_Refusal{Refusal: &gatewayv1.RefusalPart{Text: "not allowed"}},
+			}},
+		}},
+	}, nil
+}
+
+// An existing traceparent must not suppress a tracestate the caller supplied:
+// the two halves of the W3C context are decided independently.
+func TestClassifyTopics_PreservesExistingParentAndAddsState(t *testing.T) {
+	g := &fakeGateway{resp: `["fractions"]`}
+	c, err := clients.NewTopicClassifierGatewayClientWithStub(g, 0)
+	if err != nil {
+		t.Fatalf("stub: %v", err)
+	}
+	r := req()
+	r.TraceState = "congo=t61rcWkgMzE"
+	ctx := metadata.AppendToOutgoingContext(context.Background(), "traceparent", "00-aaaa-bbbb-01")
+	if _, err := c.ClassifyTopics(ctx, r); err != nil {
+		t.Fatalf("ClassifyTopics: %v", err)
+	}
+	if got := g.md.Get("traceparent"); len(got) != 1 || got[0] != "00-aaaa-bbbb-01" {
+		t.Errorf("traceparent = %v, want the existing value only", got)
+	}
+	if got := g.md.Get("tracestate"); len(got) != 1 || got[0] != "congo=t61rcWkgMzE" {
+		t.Errorf("tracestate = %v, want the caller's value", got)
 	}
 }
 

@@ -92,14 +92,6 @@ func buildSharingReuseClient() *clients.SharingReuseClient {
 const (
 	serviceName = "chora-creation"
 	version     = "0.1.0"
-
-	// defaultTopicClassifierModel — the logical model the CHO-2142 topic
-	// classifier requests from chora-model-gateway when
-	// CHORA_TOPIC_CLASSIFIER_MODEL is unset. Topic classification is a short,
-	// structured-output task; flash is sufficient and cheap (it is also the
-	// gateway's DefaultGroundedModel). The gateway's policy loader may still
-	// resolve a different model — it owns the final routing decision.
-	defaultTopicClassifierModel = "gemini-2.5-flash"
 )
 
 func main() {
@@ -884,19 +876,18 @@ func main() {
 	// backfill is an operator route, not a request-path dependency.
 	var topicClassifier atom.TopicClassifier
 	if gwTarget := strings.TrimSpace(os.Getenv("CHORA_MODEL_GATEWAY_GRPC_URL")); gwTarget != "" {
-		gwModel := strings.TrimSpace(os.Getenv("CHORA_TOPIC_CLASSIFIER_MODEL"))
-		if gwModel == "" {
-			gwModel = defaultTopicClassifierModel
-		}
-		tc, tcErr := clients.NewTopicClassifierGatewayClient(gwTarget, gwModel, 0)
+		// No model id: the gateway resolves the operation from the RPC method
+		// and serves it from the text operation's own configured routes, so
+		// CHORA_TOPIC_CLASSIFIER_MODEL is gone.
+		tc, tcErr := clients.NewTopicClassifierGatewayClient(gwTarget, 0)
 		if tcErr != nil {
 			// Fail-loud log, nil classifier — the backfill route 500s with a
 			// precise envelope rather than pretending to classify.
-			log.Printf("creation: TopicClassifier NOT wired — NewTopicClassifierGatewayClient(%q, %q) failed: %v (POST /api/internal/atoms/backfill-topic-tags will 500)",
-				gwTarget, gwModel, tcErr)
+			log.Printf("creation: TopicClassifier NOT wired — NewTopicClassifierGatewayClient(%q) failed: %v (POST /api/internal/atoms/backfill-topic-tags will 500)",
+				gwTarget, tcErr)
 		} else {
 			topicClassifier = tc
-			log.Printf("creation: TopicClassifier wired (gateway=%s, model=%s)", gwTarget, gwModel)
+			log.Printf("creation: TopicClassifier wired (gateway=%s)", gwTarget)
 		}
 	} else {
 		log.Printf("creation: TopicClassifier NOT wired (CHORA_MODEL_GATEWAY_GRPC_URL unset) — POST /api/internal/atoms/backfill-topic-tags will 500")

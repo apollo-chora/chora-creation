@@ -44,10 +44,12 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-
-	mgv1 "github.com/apollo-chora/chora-contracts/gen/go/chora/services/model_gateway/v1"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/apollo-chora/chora-creation/internal/domain/atom"
+
+	gatewayv1 "github.com/apollo-chora/chora-creation/internal/adapter/clients/gatewayv1"
 )
 
 // ErrTopicClassifierEmptyTarget is returned when the gRPC target is empty. Per
@@ -81,59 +83,55 @@ Slugs name the SUBJECT MATTER (e.g. "fractions", "number-sense", "photosynthesis
 Example reply: ["fractions","number-sense"]`
 )
 
-// topicClassifierGRPC is the slice of mgv1.ModelGatewayServiceClient this adapter
-// calls. The generated client satisfies it; tests inject a fake.
+// topicClassifierGRPC is the slice of gatewayv1.ModelGatewayServiceClient this
+// adapter calls. The generated client satisfies it; tests inject a fake.
 type topicClassifierGRPC interface {
-	Invoke(ctx context.Context, in *mgv1.InvokeRequest, opts ...grpc.CallOption) (*mgv1.InvokeResponse, error)
+	Invoke(ctx context.Context, in *gatewayv1.InvokeRequest, opts ...grpc.CallOption) (*gatewayv1.InvokeResponse, error)
 }
 
-// TopicClassifierGatewayClient implements atom.TopicClassifier over
-// chora-model-gateway.
+// TopicClassifierGatewayClient implements atom.TopicClassifier over the model
+// gateway's Invoke RPC.
 type TopicClassifierGatewayClient struct {
-	client         topicClassifierGRPC
-	logicalModelID string
-	timeout        time.Duration
+	client  topicClassifierGRPC
+	timeout time.Duration
 }
 
 // compile-time port assertion.
 var _ atom.TopicClassifier = (*TopicClassifierGatewayClient)(nil)
 
 // NewTopicClassifierGatewayClient dials the gateway at the mesh target. An empty
-// target or model id fails loud. grpc.NewClient is lazy — a healthy return does
-// not prove reachability; the first RPC surfaces Unavailable, which the backfill
-// records as a loud per-atom failure.
-func NewTopicClassifierGatewayClient(target, logicalModelID string, timeout time.Duration) (*TopicClassifierGatewayClient, error) {
+// target fails loud. grpc.NewClient is lazy — a healthy return does not prove
+// reachability; the first RPC surfaces Unavailable, which the backfill records
+// as a loud per-atom failure.
+//
+// No model id: the gateway resolves the operation from the RPC method and
+// serves it from the text operation's own configured routes.
+func NewTopicClassifierGatewayClient(target string, timeout time.Duration) (*TopicClassifierGatewayClient, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return nil, ErrTopicClassifierEmptyTarget
-	}
-	if strings.TrimSpace(logicalModelID) == "" {
-		return nil, errors.New("topic_classifier_gateway_client: logical_model_id is required")
 	}
 
 	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("topic_classifier_gateway_client: dial %s: %w", target, err)
 	}
-	return newTopicClassifier(mgv1.NewModelGatewayServiceClient(conn), logicalModelID, timeout)
+	return newTopicClassifier(gatewayv1.NewModelGatewayServiceClient(conn), timeout)
 }
 
 // NewTopicClassifierGatewayClientWithStub injects a gateway stub (tests).
-func NewTopicClassifierGatewayClientWithStub(stub topicClassifierGRPC, logicalModelID string, timeout time.Duration) (*TopicClassifierGatewayClient, error) {
+func NewTopicClassifierGatewayClientWithStub(stub topicClassifierGRPC, timeout time.Duration) (*TopicClassifierGatewayClient, error) {
 	if stub == nil {
 		return nil, errors.New("topic_classifier_gateway_client: stub is nil")
 	}
-	return newTopicClassifier(stub, logicalModelID, timeout)
+	return newTopicClassifier(stub, timeout)
 }
 
-func newTopicClassifier(c topicClassifierGRPC, logicalModelID string, timeout time.Duration) (*TopicClassifierGatewayClient, error) {
-	if strings.TrimSpace(logicalModelID) == "" {
-		return nil, errors.New("topic_classifier_gateway_client: logical_model_id is required")
-	}
+func newTopicClassifier(c topicClassifierGRPC, timeout time.Duration) (*TopicClassifierGatewayClient, error) {
 	if timeout <= 0 {
 		timeout = topicClassifyDefaultTimeout
 	}
-	return &TopicClassifierGatewayClient{client: c, logicalModelID: logicalModelID, timeout: timeout}, nil
+	return &TopicClassifierGatewayClient{client: c, timeout: timeout}, nil
 }
 
 // ClassifyTopics asks the gateway to classify one atom into topic slugs.
@@ -153,28 +151,45 @@ func (c *TopicClassifierGatewayClient) ClassifyTopics(ctx context.Context, req a
 	// A fresh UUIDv7 per call — the gateway's ledger dedup + audit key.
 	invocationID := uuid.Must(uuid.NewV7()).String()
 
-	resp, err := c.client.Invoke(ctx, &mgv1.InvokeRequest{
-		InvocationId: invocationID,
-		TenantId:     req.TenantID,
-		Gcid:         req.Gcid,
-		AgentId:      topicClassifierAgentID,
-		CrewKind:     topicClassifierCrewKind,
-		// ADR-254 D7 / ADR-252 Q1: the gateway refuses an ABSENT surface loudly
-		// (FAILED_PRECONDITION surface_unstamped) before any debit. A service
-		// caller stamps its owning surface; content_creation is not a companion
-		// surface, so the containment read does not apply and the call passes.
-		Surface:        topicClassifierCrewKind,
-		LogicalModelId: c.logicalModelID,
-		SystemPrompt:   topicClassifierSystemPrompt,
-		Prompt:         buildTopicPrompt(req),
-		Traceparent:    req.TraceParent,
-		Tracestate:     req.TraceState,
-	})
+	resp, err := c.client.Invoke(
+		withTraceContext(ctx, req.TraceParent, req.TraceState),
+		&gatewayv1.InvokeRequest{
+			InvocationId: invocationID,
+			TenantId:     req.TenantID,
+			Gcid:         proto.String(req.Gcid),
+			AgentId:      topicClassifierAgentID,
+			// ADR-254 D7 / ADR-252 Q1: the gateway refuses an ABSENT surface loudly
+			// (FAILED_PRECONDITION surface_unstamped) before any debit. A service
+			// caller stamps its owning surface; content_creation is not a companion
+			// surface, so the containment read does not apply and the call passes.
+			Surface: proto.String(topicClassifierCrewKind),
+			// No model ID: the gateway resolves the operation from the RPC
+			// method and serves it from the text operation's own routes.
+			SystemInstruction: topicClassifierSystemPrompt,
+			Messages: []*gatewayv1.Message{{
+				Role: gatewayv1.Role_ROLE_USER,
+				Content: []*gatewayv1.ContentPart{{
+					Part: &gatewayv1.ContentPart_Text{Text: &gatewayv1.TextPart{Text: buildTopicPrompt(req)}},
+				}},
+			}},
+			// crew_kind has no Invoke field; it rides in metadata_json, which
+			// the gateway maps onto the invocation's metadata. Marshalled
+			// rather than hand-built so the payload cannot be malformed.
+			MetadataJson: mustJSON(map[string]string{"crew_kind": topicClassifierCrewKind}),
+		})
 	if err != nil {
 		return nil, fmt.Errorf("topic classify (atom=%s): gateway invoke: %w", req.AtomID, err)
 	}
+	if rc := resp.GetFinishReason(); rc != gatewayv1.FinishReason_FINISH_REASON_STOP {
+		return nil, fmt.Errorf("topic classify (atom=%s): finish_reason=%s detail=%q",
+			req.AtomID, rc, resp.GetRawFinishReason())
+	}
 
-	completion := strings.TrimSpace(resp.GetCompletion())
+	answer, err := mustAnswerText(resp)
+	if err != nil {
+		return nil, fmt.Errorf("topic classify (atom=%s): %w", req.AtomID, err)
+	}
+	completion := strings.TrimSpace(answer)
 	if completion == "" {
 		return nil, fmt.Errorf("topic classify (atom=%s): gateway returned an empty completion", req.AtomID)
 	}
@@ -210,6 +225,79 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max]
+}
+
+// withTraceContext moves the W3C trace context onto the gRPC metadata. The
+// Invoke RPC has no traceparent or tracestate field; trace context travels as
+// metadata, which is where the OTel interceptor reads it.
+//
+// AppendToOutgoingContext appends rather than replaces, so an existing value is
+// left alone rather than sent twice.
+func withTraceContext(ctx context.Context, traceparent, tracestate string) context.Context {
+	md, _ := metadata.FromOutgoingContext(ctx)
+	haveParent := len(md.Get("traceparent")) > 0
+	haveState := len(md.Get("tracestate")) > 0
+
+	pairs := make([]string, 0, 4)
+	// AppendToOutgoingContext appends rather than replaces, so a value already
+	// on the outgoing metadata is left alone rather than sent twice. Each half
+	// is decided independently: an existing parent must not suppress a
+	// tracestate the caller supplied.
+	if !haveParent {
+		if traceparent = strings.TrimSpace(traceparent); traceparent != "" {
+			pairs = append(pairs, "traceparent", traceparent)
+		}
+	}
+	if !haveState {
+		if tracestate = strings.TrimSpace(tracestate); tracestate != "" {
+			pairs = append(pairs, "tracestate", tracestate)
+		}
+	}
+	if len(pairs) == 0 {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, pairs...)
+}
+
+// mustAnswerText flattens the response's output items into the model's answer.
+//
+// Only text is a valid classification. A refusal is the gateway declining to
+// answer, and dropping it silently would parse a truncated answer as a
+// complete one — so anything else is an error rather than something skipped.
+func mustAnswerText(resp *gatewayv1.InvokeResponse) (string, error) {
+	if resp == nil {
+		return "", fmt.Errorf("gateway returned no response")
+	}
+	var b strings.Builder
+	for _, item := range resp.GetOutput() {
+		part := item.GetContent()
+		if part == nil {
+			if item.GetToolCall() != nil {
+				return "", fmt.Errorf("model emitted a tool call, which is not a topic classification")
+			}
+			continue
+		}
+		switch {
+		case part.GetText() != nil:
+			b.WriteString(part.GetText().GetText())
+		case part.GetRefusal() != nil:
+			return "", fmt.Errorf("model refused: %s", part.GetRefusal().GetText())
+		default:
+			return "", fmt.Errorf("model emitted a non-text content part, which is not a topic classification")
+		}
+	}
+	return b.String(), nil
+}
+
+// mustJSON marshals caller bookkeeping into the metadata_json payload. It
+// panics on failure: the input is a fixed map of strings, so a failure would be
+// a programming error rather than a condition to handle.
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("clients: marshal metadata: %v", err))
+	}
+	return b
 }
 
 // parseTopicTags extracts the JSON array of tags from a completion. Models
