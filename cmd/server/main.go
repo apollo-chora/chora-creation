@@ -876,22 +876,18 @@ func main() {
 	// backfill is an operator route, not a request-path dependency.
 	var topicClassifier atom.TopicClassifier
 	if gwTarget := strings.TrimSpace(os.Getenv("CHORA_MODEL_GATEWAY_GRPC_URL")); gwTarget != "" {
-		gwModel := strings.TrimSpace(os.Getenv("CHORA_TOPIC_CLASSIFIER_MODEL"))
-		if gwModel == "" {
-			// Required, no fallback: a hardcoded default model name would
-			// silently pin routing the operator never chose. Fail boot loud,
-			// naming the var.
-			log.Fatalf("creation: CHORA_TOPIC_CLASSIFIER_MODEL is required when CHORA_MODEL_GATEWAY_GRPC_URL is set (no default classifier model)")
-		}
-		tc, tcErr := clients.NewTopicClassifierGatewayClient(gwTarget, gwModel, 0)
+		// No model id: the gateway resolves the operation from the RPC method
+		// and serves it from the text operation's own configured routes, so
+		// CHORA_TOPIC_CLASSIFIER_MODEL is gone.
+		tc, tcErr := clients.NewTopicClassifierGatewayClient(gwTarget, 0)
 		if tcErr != nil {
 			// Fail-loud log, nil classifier — the backfill route 500s with a
 			// precise envelope rather than pretending to classify.
-			log.Printf("creation: TopicClassifier NOT wired — NewTopicClassifierGatewayClient(%q, %q) failed: %v (POST /api/internal/atoms/backfill-topic-tags will 500)",
-				gwTarget, gwModel, tcErr)
+			log.Printf("creation: TopicClassifier NOT wired — NewTopicClassifierGatewayClient(%q) failed: %v (POST /api/internal/atoms/backfill-topic-tags will 500)",
+				gwTarget, tcErr)
 		} else {
 			topicClassifier = tc
-			log.Printf("creation: TopicClassifier wired (gateway=%s, model=%s)", gwTarget, gwModel)
+			log.Printf("creation: TopicClassifier wired (gateway=%s)", gwTarget)
 		}
 	} else {
 		log.Printf("creation: TopicClassifier NOT wired (CHORA_MODEL_GATEWAY_GRPC_URL unset) — POST /api/internal/atoms/backfill-topic-tags will 500")

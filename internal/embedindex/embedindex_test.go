@@ -25,14 +25,13 @@ type fakeEmbedder struct {
 	err error
 }
 
-func (f *fakeEmbedder) Embed(_ context.Context, tenantID, gcid, text string) ([]float32, error) {
+func (f *fakeEmbedder) Embed(_ context.Context, tenantID, gcid, text string) ([]float32, string, error) {
 	f.got = append(f.got, embedCall{TenantID: tenantID, GCID: gcid, Text: text})
 	if f.err != nil {
-		return nil, f.err
+		return nil, "", f.err
 	}
-	return f.vec, nil
+	return f.vec, testEmbeddingModelID, nil
 }
-func (f *fakeEmbedder) ModelID() string { return testEmbeddingModelID }
 
 type upsertCall struct {
 	TenantID, AtomID, ModelID string
