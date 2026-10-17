@@ -539,3 +539,166 @@ func TestAtomMediaSigner_CopyToDurable_ReturnsS3URI(t *testing.T) {
 		t.Errorf("X-Amz-Copy-Source = %q; want %s/tenants/t1/jobs/j9/x.png", gotCopySource, testTransientBucket)
 	}
 }
+
+// newCountingS3Stub returns a stub S3 endpoint that answers every copy with a
+// success envelope and counts the requests it saw, so a test can prove NO copy
+// was attempted.
+func newCountingS3Stub(t *testing.T) (*httptest.Server, *int) {
+	t.Helper()
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"etag"</ETag></CopyObjectResult>`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &requests
+}
+
+// OWNERSHIP — CopyToDurable refuses a source key outside the caller's own
+// tenant namespace. The copy runs with THIS service's credentials, so a
+// trusted bucket + origin does not prove the object belongs to the caller: on
+// the accept path the handler prefers a client-supplied image_url, so SrcKey is
+// attacker-influenced. No copy, no destination key.
+func TestAtomMediaSigner_CopyToDurable_RejectsForeignTenantSource(t *testing.T) {
+	srv, requests := newCountingS3Stub(t)
+	t.Setenv("S3_ENDPOINT", srv.URL)
+	t.Setenv("S3_ACCESS_KEY_ID", "test")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
+
+	signer, err := mediastore.NewAtomMediaSigner(testDurableBucket)
+	if err != nil {
+		t.Fatalf("NewAtomMediaSigner: %v", err)
+	}
+
+	for _, srcKey := range []string{
+		"tenants/someone-else/jobs/j9/secret.png",
+		"tenants/t11/jobs/j9/x.png", // t11 is NOT inside t1's namespace
+		"other/prefix/x.png",
+		"x.png",
+	} {
+		t.Run(srcKey, func(t *testing.T) {
+			uri, err := signer.CopyToDurable(context.Background(), ports.CopyToDurableParams{
+				SrcBucket: testTransientBucket,
+				SrcKey:    srcKey,
+				TenantID:  "t1",
+				AtomID:    "a1",
+				Ext:       "png",
+			})
+			if err == nil {
+				t.Fatalf("CopyToDurable(%q) = %q, nil; want a refusal", srcKey, uri)
+			}
+			if uri != "" {
+				t.Errorf("URI = %q on refusal; want empty (no destination key minted)", uri)
+			}
+			if !strings.Contains(err.Error(), "t1") {
+				t.Errorf("error %q should name the caller's tenant", err.Error())
+			}
+		})
+	}
+	if *requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0 (no copy attempted)", *requests)
+	}
+}
+
+// A caller-supplied key that carries a query string is redacted in the refusal,
+// exactly like every other reference this adapter reports.
+func TestAtomMediaSigner_CopyToDurable_RefusalRedactsTheKey(t *testing.T) {
+	srv, requests := newCountingS3Stub(t)
+	t.Setenv("S3_ENDPOINT", srv.URL)
+	t.Setenv("S3_ACCESS_KEY_ID", "test")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
+
+	signer, err := mediastore.NewAtomMediaSigner(testDurableBucket)
+	if err != nil {
+		t.Fatalf("NewAtomMediaSigner: %v", err)
+	}
+
+	_, err = signer.CopyToDurable(context.Background(), ports.CopyToDurableParams{
+		SrcBucket: testTransientBucket,
+		SrcKey:    "tenants/someone-else/k.png?X-Amz-Signature=SUPERSECRET",
+		TenantID:  "t1",
+		AtomID:    "a1",
+		Ext:       "png",
+	})
+	if err == nil {
+		t.Fatal("CopyToDurable should refuse a foreign-tenant key; got nil")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRET") {
+		t.Errorf("error %q must not carry the presign signature", err.Error())
+	}
+	if !strings.Contains(err.Error(), "someone-else") {
+		t.Errorf("error %q should still name the offending key", err.Error())
+	}
+	if *requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0", *requests)
+	}
+}
+
+// A same-tenant source key is accepted wherever it sits under the tenant
+// prefix. The layout namespaces by TENANT only, not by job, so the guard must
+// not over-restrict a legitimate re-home.
+func TestAtomMediaSigner_CopyToDurable_AcceptsSameTenantKey(t *testing.T) {
+	srv, requests := newCountingS3Stub(t)
+	t.Setenv("S3_ENDPOINT", srv.URL)
+	t.Setenv("S3_ACCESS_KEY_ID", "test")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
+
+	signer, err := mediastore.NewAtomMediaSigner(testDurableBucket)
+	if err != nil {
+		t.Fatalf("NewAtomMediaSigner: %v", err)
+	}
+
+	for _, srcKey := range []string{
+		"tenants/t1/jobs/j9/x.png",
+		"tenants/t1/jobs/a-completely-different-job/x.png",
+		"tenants/t1/jobs/j9/nested/deeper/x.png",
+		"tenants/t1/anything-else/x.png",
+	} {
+		uri, err := signer.CopyToDurable(context.Background(), ports.CopyToDurableParams{
+			SrcBucket: testTransientBucket,
+			SrcKey:    srcKey,
+			TenantID:  "t1",
+			AtomID:    "a1",
+			Ext:       "png",
+		})
+		if err != nil {
+			t.Errorf("CopyToDurable(%q) err = %v; want nil", srcKey, err)
+			continue
+		}
+		if !strings.HasPrefix(uri, "s3://"+testDurableBucket+"/tenants/t1/atoms/a1/") {
+			t.Errorf("URI = %q; want a durable s3:// key under tenants/t1/atoms/a1/", uri)
+		}
+	}
+	if *requests == 0 {
+		t.Error("S3 endpoint received 0 requests; want one copy per accepted key")
+	}
+}
+
+// A malformed / empty source key is still rejected by the pre-existing
+// validation, before the ownership check.
+func TestAtomMediaSigner_CopyToDurable_MalformedSourceStillRejected(t *testing.T) {
+	signer := newTestSigner(t)
+
+	for _, tc := range []struct {
+		name string
+		p    ports.CopyToDurableParams
+	}{
+		{"no bucket", ports.CopyToDurableParams{
+			SrcKey: "tenants/t1/jobs/j9/x.png", TenantID: "t1", AtomID: "a1"}},
+		{"no key", ports.CopyToDurableParams{
+			SrcBucket: testTransientBucket, TenantID: "t1", AtomID: "a1"}},
+		{"blank key", ports.CopyToDurableParams{
+			SrcBucket: testTransientBucket, SrcKey: "  ", TenantID: "t1", AtomID: "a1"}},
+		{"no tenant", ports.CopyToDurableParams{
+			SrcBucket: testTransientBucket, SrcKey: "tenants/t1/jobs/j9/x.png", AtomID: "a1"}},
+		{"no atom", ports.CopyToDurableParams{
+			SrcBucket: testTransientBucket, SrcKey: "tenants/t1/jobs/j9/x.png", TenantID: "t1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := signer.CopyToDurable(context.Background(), tc.p); err == nil {
+				t.Errorf("CopyToDurable(%s) should error; got nil", tc.name)
+			}
+		})
+	}
+}

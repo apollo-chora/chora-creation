@@ -254,6 +254,20 @@ func (s *AtomMediaSigner) CopyToDurable(ctx context.Context, p ports.CopyToDurab
 	if strings.TrimSpace(p.TenantID) == "" || strings.TrimSpace(p.AtomID) == "" {
 		return "", errors.New("atom-media: CopyToDurable requires TenantID + AtomID")
 	}
+
+	// OWNERSHIP. The copy runs with THIS service's credentials, so a trusted
+	// bucket + host does not prove the object belongs to the caller — on the
+	// accept path the handler prefers a client-supplied image_url over the
+	// stored draft's, so SrcKey is attacker-influenced. Refuse anything outside
+	// the caller's own tenant namespace BEFORE minting a destination key or
+	// touching the network.
+	tenantPrefix := ports.TransientTenantPrefix(p.TenantID)
+	if !strings.HasPrefix(p.SrcKey, tenantPrefix) {
+		return "", fmt.Errorf(
+			"atom-media: refusing to copy source key %s — it is outside tenant %q's namespace %q",
+			redactedRef(p.SrcKey), p.TenantID, tenantPrefix)
+	}
+
 	ext := strings.TrimSpace(p.Ext)
 	if ext == "" {
 		ext = "png"

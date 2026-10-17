@@ -37,6 +37,11 @@ type fakeCopier struct {
 	// classifyErr, when set, is returned by ClassifyReference — used to
 	// prove the service fails loud BEFORE attempting any copy.
 	classifyErr error
+
+	// classifyRet, when set, is returned verbatim by ClassifyReference — lets
+	// a test hand the service a specific classified ref (e.g. one whose key
+	// belongs to another tenant) without contorting the URL grammar.
+	classifyRet *ports.MediaReference
 }
 
 func (f *fakeCopier) CopyToDurable(_ context.Context, p ports.CopyToDurableParams) (string, error) {
@@ -56,6 +61,9 @@ func (f *fakeCopier) DurableBucket() string { return durableBucket }
 func (f *fakeCopier) ClassifyReference(_ context.Context, raw string) (ports.MediaReference, error) {
 	if f.classifyErr != nil {
 		return ports.MediaReference{}, f.classifyErr
+	}
+	if f.classifyRet != nil {
+		return *f.classifyRet, nil
 	}
 	ref := strings.TrimSpace(raw)
 	for _, scheme := range []string{"s3://", "gs://"} {
@@ -295,6 +303,98 @@ func TestReHome_NoExtension_DefaultsPNG(t *testing.T) {
 	}
 	if f.got.Ext != "png" {
 		t.Errorf("Ext = %q; want png (default)", f.got.Ext)
+	}
+}
+
+// OWNERSHIP — a transient ref whose key belongs to ANOTHER tenant is refused
+// before the copy. Defense in depth behind the adapter's own guard: the accept
+// path prefers a client-supplied image_url, and the copy runs with the
+// adapter's credentials, so a trusted origin + bucket does not prove ownership.
+func TestReHome_ForeignTenantSource_NoCopy(t *testing.T) {
+	t.Parallel()
+	f := &fakeCopier{classifyRet: &ports.MediaReference{
+		Kind:   ports.MediaReferenceTransient,
+		Bucket: transientBucket,
+		Key:    "tenants/someone-else/jobs/j9/secret.png",
+	}}
+	svc := mediarehome.New(f)
+
+	got, changed, err := svc.ReHome(context.Background(), "t1", "a1",
+		"https://storage.googleapis.com/"+transientBucket+"/tenants/someone-else/jobs/j9/secret.png?sig=1")
+	if err == nil {
+		t.Fatal("ReHome(foreign-tenant source) should error; got nil")
+	}
+	if got != "" || changed {
+		t.Errorf("ReHome(foreign-tenant source) = (%q,%v); want (\"\",false)", got, changed)
+	}
+	if f.called != 0 {
+		t.Errorf("copier called %d times for a foreign-tenant source; want 0 (no copy attempted)", f.called)
+	}
+	if !strings.Contains(err.Error(), "t1") {
+		t.Errorf("error %q should name the caller's tenant", err.Error())
+	}
+	if !strings.Contains(err.Error(), "someone-else") {
+		t.Errorf("error %q should name the offending key", err.Error())
+	}
+	if !strings.Contains(err.Error(), "mediarehome") {
+		t.Errorf("error %q should stay namespaced", err.Error())
+	}
+}
+
+// The prefix boundary is the tenant segment: tenant "t1" must not match the
+// "tenants/t11/" namespace.
+func TestReHome_TenantPrefixBoundary_NoCopy(t *testing.T) {
+	t.Parallel()
+	f := &fakeCopier{classifyRet: &ports.MediaReference{
+		Kind:   ports.MediaReferenceTransient,
+		Bucket: transientBucket,
+		Key:    "tenants/t11/jobs/j9/x.png",
+	}}
+	svc := mediarehome.New(f)
+	if _, _, err := svc.ReHome(context.Background(), "t1", "a1", "https://x/y"); err == nil {
+		t.Error("tenant t1 must not match the t11 namespace; want an error")
+	}
+	if f.called != 0 {
+		t.Errorf("copier called %d times; want 0", f.called)
+	}
+}
+
+// Only the TENANT is namespaced, not the job: a same-tenant key under any job
+// (or none) is a legitimate re-home source, so the guard must not
+// over-restrict.
+func TestReHome_SameTenantOtherJob_Copies(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{
+		"tenants/t1/jobs/a-completely-different-job/x.png",
+		"tenants/t1/jobs/j9/nested/deeper/y.png",
+		"tenants/t1/anything-else/z.png",
+	} {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+			want := "s3://" + durableBucket + "/tenants/t1/atoms/a1/new.png"
+			f := &fakeCopier{
+				classifyRet: &ports.MediaReference{
+					Kind:   ports.MediaReferenceTransient,
+					Bucket: transientBucket,
+					Key:    key,
+				},
+				retURI: want,
+			}
+			svc := mediarehome.New(f)
+			got, changed, err := svc.ReHome(context.Background(), "t1", "a1", "https://x/y")
+			if err != nil {
+				t.Fatalf("ReHome(same-tenant key %q) err = %v; want nil", key, err)
+			}
+			if !changed || got != want {
+				t.Errorf("ReHome(%q) = (%q,%v); want (%q,true)", key, got, changed, want)
+			}
+			if f.called != 1 {
+				t.Errorf("copier called %d times; want 1", f.called)
+			}
+			if f.got.SrcKey != key {
+				t.Errorf("SrcKey = %q; want %q", f.got.SrcKey, key)
+			}
+		})
 	}
 }
 

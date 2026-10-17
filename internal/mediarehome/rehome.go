@@ -35,6 +35,7 @@ func New(copier ports.MediaReHomer) *Service { return &Service{copier: copier} }
 //   - empty input              → ("", false, nil)  (no image)
 //   - already-durable ref       → (ref, false, nil) (idempotent — no copy)
 //   - transient ref             → (durable ref, true, nil) after copy
+//   - foreign-tenant source     → ("", false, error) (fail-loud — no copy)
 //   - unclassifiable ref        → ("", false, error) (fail-loud)
 //
 // tenantID + atomID scope the destination key. A publish that re-homes the
@@ -58,6 +59,17 @@ func (s *Service) ReHome(ctx context.Context, tenantID, atomID, imageURL string)
 		return raw, false, nil
 	}
 
+	// OWNERSHIP (defense in depth — the adapter checks this too). A trusted
+	// origin + bucket does not prove the object belongs to the tenant being
+	// accepted: the accept path prefers a client-supplied image_url over the
+	// stored draft's, and the copy runs with the adapter's own credentials.
+	// Refuse a foreign-tenant source before asking for the copy.
+	if !sourceBelongsToTenant(tenantID, ref.Key) {
+		return "", false, fmt.Errorf(
+			"mediarehome: refusing to re-home %q — source object is outside tenant %q's namespace %q",
+			ref.Key, tenantID, ports.TransientTenantPrefix(tenantID))
+	}
+
 	durableURI, err := s.copier.CopyToDurable(ctx, ports.CopyToDurableParams{
 		SrcBucket: ref.Bucket,
 		SrcKey:    ref.Key,
@@ -69,6 +81,17 @@ func (s *Service) ReHome(ctx context.Context, tenantID, atomID, imageURL string)
 		return "", false, fmt.Errorf("mediarehome: copy: %w", err)
 	}
 	return durableURI, true, nil
+}
+
+// sourceBelongsToTenant reports whether a classified transient source key sits
+// under the caller's own per-tenant namespace (ports.TransientTenantPrefix).
+//
+// Only the TENANT is namespaced, not the job: a same-tenant key under any job
+// is a legitimate re-home source, so this deliberately does not narrow to
+// `jobs/{job_id}/`. ref.Key comes from ClassifyReference, which strips the
+// presign query, so it is safe to name in the error.
+func sourceBelongsToTenant(tenantID, key string) bool {
+	return strings.HasPrefix(key, ports.TransientTenantPrefix(tenantID))
 }
 
 // extOf returns the lowercased file extension of an object key, defaulting

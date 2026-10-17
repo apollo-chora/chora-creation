@@ -16,6 +16,28 @@ package ports
 
 import "context"
 
+// TransientTenantPrefix returns the per-tenant namespace prefix that every
+// atom-media object key lives under — `tenants/{tenant_id}/`.
+//
+// It is the OWNERSHIP boundary for a re-home. Two writers put objects under
+// it: the orchestrator (qgen) writes each rendered question/answer image into
+// the transient generated-image bucket at
+// `tenants/{tenant_id}/jobs/{job_id}/{file}.{ext}`, and this service writes the
+// durable copy at `tenants/{tenant_id}/atoms/{atom_id}/{object_id}.{ext}`.
+// Because the copy runs with the ADAPTER's own credentials, a trusted host and
+// bucket do not prove the object belongs to the caller — a client-supplied
+// image_url can name any object in the transient bucket — so both the service
+// and the adapter refuse a source key outside the caller's own prefix.
+//
+// The trailing slash is part of the prefix: `tenants/abc/` must never match
+// `tenants/abcd/`.
+//
+// Only the TENANT is namespaced, not the job: a same-tenant key under any job
+// is a legitimate re-home source.
+func TransientTenantPrefix(tenantID string) string {
+	return "tenants/" + tenantID + "/"
+}
+
 // CopyToDurableParams is the input to MediaReHomer.CopyToDurable. The
 // destination object key is built BY the adapter (it owns the canonical
 // `tenants/{tenant_id}/atoms/{atom_id}/{object_id}.{ext}` shape via
@@ -23,7 +45,9 @@ import "context"
 // owning atom + the file extension.
 type CopyToDurableParams struct {
 	// SrcBucket / SrcKey locate the source object in the transient bucket
-	// (supplied by the re-home service from ClassifyReference).
+	// (supplied by the re-home service from ClassifyReference). SrcKey MUST
+	// sit under TransientTenantPrefix(TenantID): the adapter refuses to copy a
+	// source object belonging to another tenant.
 	SrcBucket string
 	SrcKey    string
 
