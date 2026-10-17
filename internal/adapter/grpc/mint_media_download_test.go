@@ -160,6 +160,15 @@ func TestMintAtomMediaDownloadURL_NoTenant_InvalidArgument(t *testing.T) {
 	}
 }
 
+// Nil request → InvalidArgument: the nil check must precede any field read.
+func TestMintAtomMediaDownloadURL_NilRequest_InvalidArgument(t *testing.T) {
+	srv := NewCreationServer(Deps{DownloadSigner: &fakeDownloadSigner{}})
+	_, err := srv.MintAtomMediaDownloadURL(context.Background(), nil)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("code = %v; want InvalidArgument", status.Code(err))
+	}
+}
+
 // Empty gs_uris → empty (but non-nil) result set, no error.
 func TestMintAtomMediaDownloadURL_EmptyBatch(t *testing.T) {
 	srv := NewCreationServer(Deps{DownloadSigner: &fakeDownloadSigner{}})

@@ -1079,8 +1079,11 @@ func seedQuestionRefsDirect(t *testing.T, signer ports.AtomMediaDownloadSigner, 
 	return srv, qRepo, a.AtomID
 }
 
-// A transient https ref (draft atom, pre-publish) must pass through unchanged
-// and the signer must NOT be invoked for it.
+// A transient https ref (draft atom, pre-publish) that the caller's tenant
+// OWNS passes through unchanged — the signer must NOT be invoked for it. The
+// ownership gate runs on every ref before either minting or pass-through, so
+// the fixture must carry the caller's own tenant namespace (a transient ref
+// with none is dropped, not passed through).
 func TestGetQuestionByID_PassesThroughTransientHTTPS(t *testing.T) {
 	t.Parallel()
 	called := false
@@ -1088,7 +1091,7 @@ func TestGetQuestionByID_PassesThroughTransientHTTPS(t *testing.T) {
 		called = true
 		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
 	}}
-	transient := "https://storage.googleapis.com/chora-ai-assist-images-dev/x.png?X-Goog-Expires=604800"
+	transient := "https://storage.googleapis.com/chora-ai-assist-images-dev/tenants/" + tenantA + "/jobs/j1/stem.png?X-Goog-Expires=604800"
 	srv, qRepo, atomID := seedQuestionRefsDirect(t, signer, transient, "")
 
 	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)

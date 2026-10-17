@@ -1068,11 +1068,11 @@ func (h *QuestionsHandler) getQuestion(w http.ResponseWriter, r *http.Request, a
 
 // mintQuestionMedia returns a shallow copy of q whose MCQ/OE ImageURL +
 // AnswerImageURL durable refs are resolved to fresh signed GET URLs for the
-// authoring re-open path. Transient http(s) refs pass through unchanged. On a
-// mint failure the ref is dropped (nil) and logged — and so is any ref that is
-// neither mintable nor fetchable — so a raw durable URI is NEVER emitted to the
-// wire. The response is still served. A nil signer (tests / unwired) still
-// drops durable refs rather than emitting them raw.
+// authoring re-open path. Owned transient http(s) refs pass through unchanged.
+// On a mint failure the ref is dropped (nil) and logged — and so is any ref
+// that is neither mintable nor fetchable — so a raw durable URI is NEVER emitted
+// to the wire. The response is still served. A nil signer (tests / unwired)
+// still drops durable refs rather than emitting them raw.
 func (h *QuestionsHandler) mintQuestionMedia(ctx context.Context, q *question.Question) *question.Question {
 	if q == nil {
 		return q
@@ -1093,12 +1093,14 @@ func (h *QuestionsHandler) mintQuestionMedia(ctx context.Context, q *question.Qu
 	return &out
 }
 
-// mintMediaRef resolves a single image ref: a durable atom-media ref (per the
-// signer's own IsDurableRef) is minted to a fresh signed GET URL; a transient
-// http(s) ref (or empty/nil) passes through; a mint failure, a ref the tenant
-// does not own, and any ref that is neither mintable nor fetchable are dropped
-// to nil — never a raw durable URI on the wire. This call site does not know the
-// storage scheme.
+// mintMediaRef resolves a single image ref: EVERY non-empty ref — durable
+// atom-media URI OR transient http(s) URL — is first classified and
+// ownership-checked against the caller's own tenant namespace. A durable ref
+// the tenant owns is then minted to a fresh signed GET URL; an OWNED transient
+// http(s) ref passes through unchanged. A mint failure, a ref the tenant does
+// not own, and any ref that is neither mintable nor fetchable are dropped to
+// nil — never a raw durable URI, never an unowned URL, on the wire. This call
+// site does not know the storage scheme.
 func (h *QuestionsHandler) mintMediaRef(ctx context.Context, tenantID string, ref *string) *string {
 	if ref == nil || *ref == "" {
 		return ref
@@ -1108,7 +1110,10 @@ func (h *QuestionsHandler) mintMediaRef(ctx context.Context, tenantID string, re
 		// rather than emitted raw; a transient http(s) ref is already
 		// fetchable. The drop is LOGGED because the request still succeeds —
 		// without it a misconfigured deployment shows a silently missing
-		// illustration on the author re-open.
+		// illustration on the author re-open. This is the documented
+		// external-image-mode policy (see question_media_rehome.go), not a
+		// silent assertion that the ref is safe: ownership is simply not
+		// classifiable without a storage adapter.
 		if !isFetchableMediaRef(*ref) {
 			log.Printf("getQuestion: media download signer NOT wired — dropping ref %s from the author projection",
 				redactMediaRef(*ref))
@@ -1116,23 +1121,24 @@ func (h *QuestionsHandler) mintMediaRef(ctx context.Context, tenantID string, re
 		}
 		return ref
 	}
-	if !h.mediaDownloadSigner.IsDurableRef(*ref) {
-		// Not a durable atom-media object: a transient http(s) ref is already
-		// fetchable; anything else (a foreign bucket, a malformed ref) is
-		// dropped rather than emitted raw.
-		if isFetchableMediaRef(*ref) {
-			return ref
-		}
-		return nil
-	}
-	// OWNERSHIP — SignDownloadURL scopes on BUCKET only, and the durable bucket
-	// is shared by every tenant, so a stored ref is served only when this
-	// tenant owns its object key. Defence in depth against a legacy row that
+	// OWNERSHIP FIRST — before anything is signed or passed through.
+	// SignDownloadURL scopes on BUCKET only and the durable bucket is shared
+	// by every tenant, so a stored ref is served only when this tenant owns
+	// its object key. The check runs on EVERY non-empty ref, not just durable
+	// ones: TenantOwnsRef classifies a transient http(s) URL exactly like a
+	// durable URI, so a pre-existing payload carrying ANOTHER tenant's
+	// transient object on the trusted origin is refused here too — passed
+	// through before this fix. Defence in depth against a legacy row that
 	// predates the write-seam guards.
 	if owns, oerr := h.mediaDownloadSigner.TenantOwnsRef(ctx, tenantID, *ref); oerr != nil || !owns {
 		log.Printf("getQuestion: dropping ref %s from the author projection — not owned by tenant %q (err=%v)",
 			redactMediaRef(*ref), tenantID, oerr)
 		return nil
+	}
+	if !h.mediaDownloadSigner.IsDurableRef(*ref) {
+		// Owned transient http(s) ref: already fetchable; pass through
+		// unchanged. Ownership is established above, so this is safe.
+		return ref
 	}
 	signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
 	if err != nil {

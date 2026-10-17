@@ -13,9 +13,12 @@
 //  2. mints the SINGLETON immutable orphan edition per (atom,
 //     last-published-revision) — DB-enforced by the partial unique index from
 //     migration 0030; a conflict returns the existing orphan,
-//  3. clones the question + latest revision onto the orphan (heal-on-
-//     redelivery: a torn write from a crash between the atom insert and the
-//     question save is repaired on the conflict path),
+//  3. clones the question + latest revision onto the orphan — after an
+//     OWNERSHIP-ONLY validation of the refs that revision carries (no copy:
+//     this path has no caller-supplied input, and an already-durable ref
+//     needs none) — (heal-on-redelivery: a torn write from a crash between
+//     the atom insert and the question save is repaired on the conflict
+//     path),
 //  4. repoints creation's OWN non-author collection entries (same DB,
 //     idempotent — the author's entries keep the live atom),
 //  5. publishes chora.creation.atom.orphan_created.v1 via the durable outbox
@@ -47,6 +50,7 @@ import (
 	"github.com/apollo-chora/chora-creation/internal/adapter/outbox"
 	"github.com/apollo-chora/chora-creation/internal/domain/atom"
 	"github.com/apollo-chora/chora-creation/internal/domain/question"
+	"github.com/apollo-chora/chora-creation/internal/ports"
 )
 
 // TopicAtomReuseOrphanRequired is the consumed sharing topic.
@@ -107,7 +111,12 @@ type OrphanRequiredConfig struct {
 	Atoms     OrphanAtomRepository
 	Questions OrphanQuestionRepository
 	Publisher atom.EventPublisher
-	Logger    *log.Logger
+	// MediaSigner classifies the source revision's image refs for OWNERSHIP
+	// before the orphan question is saved (nil ⇒ external-image mode: no
+	// storage adapter, no grammar — the check is skipped, exactly as on the
+	// HTTP write seams; see question_media_rehome.go's package doc).
+	MediaSigner ports.AtomMediaDownloadSigner
+	Logger      *log.Logger
 }
 
 // OrphanRequiredSubscriber handles orphan_required.v1 deliveries.
@@ -255,6 +264,24 @@ func (s *OrphanRequiredSubscriber) cloneQuestionOnto(ctx context.Context, orphan
 			prompt = srcRev.Prompt
 		}
 	}
+	// OWNERSHIP-ONLY validation, BEFORE anything is saved.
+	//
+	// This path has NO caller-supplied input: the source question is loaded
+	// with the EVENT's tenant, the orphan inherits that same tenant via
+	// atom.CloneOrphan, and no HTTP caller threads an image URL into a
+	// saga event. The refs being re-persisted are therefore exactly the
+	// stored row's own — so a copier / re-homer dependency is deliberately
+	// NOT added here (nothing new can be introduced to copy, and an
+	// already-durable ref needs no copy); the only risk is a LEGACY revision
+	// that already carries a foreign-tenant ref, and ownership
+	// classification alone catches it. With no storage adapter wired (nil
+	// signer — external-image mode) there is no grammar to classify with, so
+	// the check is skipped, exactly as on the HTTP write seams.
+	if s.cfg.MediaSigner != nil {
+		if err := validateOrphanMediaOwnership(ctx, s.cfg.MediaSigner, orphan.TenantID, srcQ.Type, mcq, oe); err != nil {
+			return err
+		}
+	}
 	newQ, err := question.New(question.NewParams{
 		TenantID:   orphan.TenantID,
 		AtomID:     orphan.AtomID,
@@ -274,6 +301,39 @@ func (s *OrphanRequiredSubscriber) cloneQuestionOnto(ctx context.Context, orphan
 	}
 	newQ.LatestRevisionID = rev.RevisionID
 	return s.cfg.Questions.Save(ctx, newQ, rev)
+}
+
+// validateOrphanMediaOwnership refuses to re-persist a payload carrying an
+// image ref outside the source tenant's own namespace. The orphan inherits
+// the source tenant, so an owned ref needs no copy and an unowned one must
+// never be written into a new question revision.
+func validateOrphanMediaOwnership(ctx context.Context, signer ports.AtomMediaDownloadSigner, tenantID string, qType question.QuestionType, mcq *question.MCQPayload, oe *question.OEPayload) error {
+	var refs []*string
+	switch qType {
+	case question.TypeMCQ:
+		if mcq != nil {
+			refs = []*string{mcq.ImageURL, mcq.AnswerImageURL}
+		}
+	case question.TypeOpenEnded:
+		if oe != nil {
+			refs = []*string{oe.ImageURL, oe.AnswerImageURL}
+		}
+	}
+	for _, ref := range refs {
+		if ref == nil || strings.TrimSpace(*ref) == "" {
+			continue
+		}
+		owns, err := signer.TenantOwnsRef(ctx, tenantID, *ref)
+		if err != nil {
+			return fmt.Errorf("orphan_required: classify media ref for tenant %s: %w", tenantID, err)
+		}
+		if !owns {
+			return fmt.Errorf(
+				"orphan_required: refusing to re-persist image ref outside tenant %q's namespace %q (storage reference not owned by the source tenant)",
+				tenantID, ports.TenantMediaPrefix(tenantID))
+		}
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------

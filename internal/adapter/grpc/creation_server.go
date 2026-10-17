@@ -643,8 +643,11 @@ func (s *CreationServer) MintAtomMediaDownloadURL(ctx context.Context, in *creat
 	if s.downloadSigner == nil {
 		return nil, status.Error(codes.FailedPrecondition, "creation: atom-media download signer not wired (ATOM_MEDIA_BUCKET unset?)")
 	}
+	if in == nil {
+		return nil, status.Error(codes.InvalidArgument, "creation: nil request")
+	}
 	tenantID := strings.TrimSpace(in.GetTenantId())
-	if in == nil || tenantID == "" {
+	if tenantID == "" {
 		return nil, status.Error(codes.InvalidArgument, "creation: tenant_id required")
 	}
 

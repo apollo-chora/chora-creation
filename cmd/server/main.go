@@ -799,24 +799,6 @@ func main() {
 			questionRepo != nil, bus != nil)
 	}
 
-	// ADR-229 Amendment A1 (CHO-2132) — orphan-edition mint. Consumes
-	// chora.sharing.atom_reuse.orphan_required.v1 (sharing's grant table is
-	// the authoritative stranded-consumer registry), mints the singleton
-	// orphan edition + clones its question + repoints creation's own
-	// non-author collection entries, then answers with
-	// chora.creation.atom.orphan_created.v1 via the durable outbox.
-	if orphanAtoms != nil && orphanQuestions != nil && bus != nil {
-		orphanSub := pubsubadapter.NewOrphanRequiredSubscriber(pubsubadapter.OrphanRequiredConfig{
-			Atoms:     orphanAtoms,
-			Questions: orphanQuestions,
-			Publisher: publisher,
-		})
-		registerOrphanRequiredSubscriber(ctx, bus, orphanSub)
-	} else {
-		log.Printf("creation: orphan_required subscriber NOT wired — missing deps (pgRepos=%v, bus=%v)",
-			orphanAtoms != nil && orphanQuestions != nil, bus != nil)
-	}
-
 	// ATOM Phase 1 (ADR-156) — atom-media V4 signed URL minter wiring.
 	// Bucket name comes from env ATOM_MEDIA_BUCKET. Per
 	// feedback_no_inline_config + feedback_no_stubs_real_wiring: empty env
@@ -866,6 +848,30 @@ func main() {
 	if atomMediaSigner != nil {
 		mediaReHomer = atomMediaSigner.(ports.MediaReHomer)
 		mediaDownloadSigner = atomMediaSigner.(ports.AtomMediaDownloadSigner)
+	}
+
+	// ADR-229 Amendment A1 (CHO-2132) — orphan-edition mint. Consumes
+	// chora.sharing.atom_reuse.orphan_required.v1 (sharing's grant table is
+	// the authoritative stranded-consumer registry), mints the singleton
+	// orphan edition + clones its question + repoints creation's own
+	// non-author collection entries, then answers with
+	// chora.creation.atom.orphan_created.v1 via the durable outbox.
+	//
+	// The orphan clone re-persists the source revision's stored refs, so the
+	// download signer rides along for their OWNERSHIP-ONLY validation (no
+	// copier — this path has no caller-supplied input); nil (no bucket wired)
+	// is the documented external-image mode, not a misconfiguration.
+	if orphanAtoms != nil && orphanQuestions != nil && bus != nil {
+		orphanSub := pubsubadapter.NewOrphanRequiredSubscriber(pubsubadapter.OrphanRequiredConfig{
+			Atoms:       orphanAtoms,
+			Questions:   orphanQuestions,
+			Publisher:   publisher,
+			MediaSigner: mediaDownloadSigner,
+		})
+		registerOrphanRequiredSubscriber(ctx, bus, orphanSub)
+	} else {
+		log.Printf("creation: orphan_required subscriber NOT wired — missing deps (pgRepos=%v, bus=%v)",
+			orphanAtoms != nil && orphanQuestions != nil, bus != nil)
 	}
 
 	// CHO-2142 — atom topic classifier for the topic-tag backfill. Dials

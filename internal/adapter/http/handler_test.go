@@ -845,8 +845,11 @@ func TestGetAtom_UnwiredSignerDropsDurableImageRef(t *testing.T) {
 	}
 }
 
-// A transient http(s) ref is already fetchable and passes through the learner
-// projection unchanged — the signer is not consulted.
+// A transient http(s) ref that the caller's tenant OWNS is already fetchable
+// and passes through the learner projection unchanged — the signer is not
+// consulted. (The ownership gate runs before pass-through, so the fixture
+// carries the caller's own tenant namespace; a transient ref with none is
+// dropped, not passed through.)
 func TestGetAtom_TransientImagePassesThrough(t *testing.T) {
 	t.Parallel()
 	called := false
@@ -854,10 +857,10 @@ func TestGetAtom_TransientImagePassesThrough(t *testing.T) {
 		called = true
 		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
 	}}
-	transient := "https://storage.googleapis.com/chora-ai-assist-images-dev/x.png?X-Goog-Expires=604800"
-	// Seeded DIRECTLY: this ref carries no tenant namespace, so the create seam
-	// refuses it. The learner projection must still pass a fetchable http(s) ref
-	// through unchanged, so the fixture writes the stored row directly.
+	transient := "https://storage.googleapis.com/chora-ai-assist-images-dev/tenants/" + tenantA + "/jobs/j1/stem.png?X-Goog-Expires=604800"
+	// Seeded DIRECTLY (the fixture bypasses the write seam): the learner
+	// projection must still pass an owned, fetchable http(s) ref through
+	// unchanged, so the stored row is written directly.
 	srv, _, atomID := seedQuestionRefsDirect(t, signer, transient, "")
 	w2 := httptest.NewRecorder()
 	srv.ServeHTTP(w2, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))

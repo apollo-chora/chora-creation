@@ -1203,11 +1203,14 @@ func (h *AtomHandler) projectAtomWithQuestion(ctx context.Context, a *atom.Learn
 // fresh short-lived signed GET URL for the LEARNER-safe projection. Mirrors the
 // author getQuestion mint (questions_handler.mintMediaRef) but is ONLY ever
 // called with the QUESTION image — the model-answer illustration is never
-// projected to learners (Security-wins). A transient http(s) ref passes through;
-// a nil/empty ref, an unwired signer, a foreign-tenant ref, or a mint failure
-// drops the ref to nil so a raw durable URI is NEVER emitted to the wire.
-// Whether a ref is durable is the SIGNER's answer (IsDurableRef) — this call
-// site does not know the storage scheme.
+// projected to learners (Security-wins). EVERY non-empty ref — durable URI or
+// transient http(s) URL — is first classified and ownership-checked against
+// the caller's tenant namespace; only an OWNED durable ref is then minted and
+// an OWNED transient http(s) ref passes through. A nil/empty ref, an unwired
+// signer, a foreign-tenant ref, or a mint failure drops the ref to nil so a
+// raw durable URI is NEVER emitted to the wire. Whether a ref is durable is the
+// SIGNER's answer (IsDurableRef) — this call site does not know the storage
+// scheme.
 func (h *AtomHandler) signQuestionImage(ctx context.Context, tenantID string, ref *string) *string {
 	if ref == nil || *ref == "" {
 		return nil
@@ -1217,7 +1220,10 @@ func (h *AtomHandler) signQuestionImage(ctx context.Context, tenantID string, re
 		// rather than emitted raw. A transient http(s) ref is already
 		// fetchable and passes through. The drop is LOGGED because the request
 		// still succeeds — without it a misconfigured deployment shows a
-		// silently missing illustration.
+		// silently missing illustration. This is the documented
+		// external-image-mode policy (see question_media_rehome.go), not a
+		// silent assertion that the ref is safe: ownership is simply not
+		// classifiable without a storage adapter.
 		if !isFetchableMediaRef(*ref) {
 			log.Printf("getAtom: media download signer NOT wired — dropping question image ref %s from the learner projection",
 				redactMediaRef(*ref))
@@ -1225,23 +1231,24 @@ func (h *AtomHandler) signQuestionImage(ctx context.Context, tenantID string, re
 		}
 		return ref
 	}
-	if !h.mediaDownloadSigner.IsDurableRef(*ref) {
-		// Not a durable atom-media object: a transient http(s) ref is already
-		// fetchable; anything else (a foreign bucket, a malformed ref) is
-		// dropped rather than emitted raw.
-		if isFetchableMediaRef(*ref) {
-			return ref
-		}
-		return nil
-	}
-	// OWNERSHIP — SignDownloadURL scopes on BUCKET only, and the durable bucket
-	// is shared by every tenant, so a stored ref is served only when this
-	// tenant owns its object key. Defence in depth against a legacy row that
+	// OWNERSHIP FIRST — before anything is signed or passed through.
+	// SignDownloadURL scopes on BUCKET only, and the durable bucket is shared
+	// by every tenant, so a stored ref is served only when this tenant owns
+	// its object key. The check runs on EVERY non-empty ref, not just durable
+	// ones: TenantOwnsRef classifies a transient http(s) URL exactly like a
+	// durable URI, so a pre-existing payload carrying ANOTHER tenant's
+	// transient object on the trusted origin is refused here too — passed
+	// through before this fix. Defence in depth against a legacy row that
 	// predates the write-seam guards.
 	if owns, oerr := h.mediaDownloadSigner.TenantOwnsRef(ctx, tenantID, *ref); oerr != nil || !owns {
 		log.Printf("getAtom: dropping question image ref %s from the learner projection — not owned by tenant %q (err=%v)",
 			redactMediaRef(*ref), tenantID, oerr)
 		return nil
+	}
+	if !h.mediaDownloadSigner.IsDurableRef(*ref) {
+		// Owned transient http(s) ref: already fetchable; pass through
+		// unchanged. Ownership is established above, so this is safe.
+		return ref
 	}
 	signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
 	if err != nil {

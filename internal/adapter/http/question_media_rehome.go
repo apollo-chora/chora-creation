@@ -13,6 +13,10 @@
 // the policy note on ports.TenantMediaPrefix for why job/author-level scoping is
 // a separate product question.
 //
+// The invariant is enforced on every seam below WHENEVER A STORAGE ADAPTER IS
+// WIRED. With NO storage adapter wired the service runs in EXTERNAL-IMAGE MODE,
+// which does NOT enforce it — see that section below for its exact policy.
+//
 // # Every seam, and what each enforces
 //
 // WRITE (persists an image ref):
@@ -33,10 +37,12 @@
 //   - publishAtom, publish_atom_handler.go — ReHomeRevision. Introduces no new
 //     refs (it re-homes the ALREADY-STORED revision), so it cannot introduce a
 //     foreign one; with no copier wired it persists nothing at all.
-//   - cloneQuestionOnto, pubsub/orphan_required_subscriber.go — re-persists the
-//     SAME tenant's refs (the orphan inherits the source's tenant via
-//     atom.CloneOrphan, and there is no caller input), so it cannot introduce a
-//     foreign ref. Left unwired rather than given a media dependency.
+//   - cloneQuestionOnto, pubsub/orphan_required_subscriber.go — OWNERSHIP-ONLY
+//     validation over the latest revision's refs BEFORE the orphan question is
+//     saved (no copier: this path has no caller-supplied input — see the note
+//     there — and an already-durable ref needs no copy). A legacy revision
+//     already carrying a foreign-tenant ref is refused, not re-persisted. With
+//     no storage adapter wired (nil signer) it is the external-image mode.
 //   - the qgen draft layer (pubsub/ai_assist_terminal_subscriber.go,
 //     pubsub/candidate_normalizer.go) writes transient refs into the ComposeJob
 //     candidate JSON, never into a question payload; the accept seam guards them
@@ -49,18 +55,35 @@
 //   - mintMediaRef, questions_handler.go — the author re-open projection.
 //   - signQuestionImage, handler.go — the learner projection.
 //
-// The two HTTP serve paths and the gRPC one each gate on TenantOwnsRef, because
-// SignDownloadURL itself only scopes the bucket: a legacy row written before
-// these write guards existed would otherwise still be signed and served.
+// The two HTTP serve paths and the gRPC one each gate on TenantOwnsRef for
+// EVERY non-empty ref — durable AND transient http(s) — because SignDownloadURL
+// itself only scopes the bucket: a legacy row written before these write guards
+// existed, or a payload carrying another tenant's transient object on the
+// trusted origin, would otherwise still be signed and served.
+//
+// # External-image mode (no storage adapter wired)
+//
+// When NEITHER the re-homer NOR the download signer is wired, guardMediaPayload
+// is a deliberate no-op: there is no grammar with which to classify a reference
+// and no signed URL can ever be minted. The service runs in EXTERNAL-IMAGE
+// MODE. Its policy, explicitly:
+//
+//   - refs are persisted verbatim, WITHOUT any ownership classification;
+//   - the tenant-isolation invariant above is NOT enforced on the write seam
+//     in this mode — this is a documented deployment shape (the alternative,
+//     refusing every image ref, would break authoring on such a deployment for
+//     no security gain), NOT a silent fail-open;
+//   - what the mode DOES guarantee: a durable ref can never be SERVED — with no
+//     signer, nothing can mint it, and both read projections drop it outright —
+//     and an http(s) ref renders only while it remains fetchable. The same
+//     policy governs the read projections' no-signer branch and the orphan
+//     path's nil-signer branch, so every seam agrees.
 //
 // # The copier is not the gate
 //
 // guardMediaPayload enforces OWNERSHIP whenever a storage adapter is reachable —
 // through the re-homer when it is wired, else through the download signer — and
-// only skips the COPY when no copier exists. With NO storage adapter wired at
-// all there is no grammar to classify with and no signed URL can ever be minted
-// (the read projection drops durable refs), so refs are persisted verbatim; that
-// is the documented policy, not a silent fail-open.
+// only skips the COPY when no copier exists.
 //
 // # Durability
 //
@@ -237,13 +260,15 @@ func (rh *questionImageReHomer) applyPair(ctx context.Context, tenantID, atomID 
 //   - re-homer wired            → classify + ownership-check + re-home in place.
 //   - no re-homer, signer wired → ownership-check only (the COPY is skipped —
 //     there is no copier). A foreign-tenant ref is still REJECTED.
-//   - neither wired             → NO storage adapter is configured at all: there
-//     is no grammar with which to classify a reference, and no signed URL can
-//     ever be minted (the read projection drops durable refs, and a transient
-//     http(s) ref is a presigned URL its holder can already fetch). References
-//     are persisted verbatim. This is the documented policy for a deployment
-//     with no atom-media backend — the alternative, refusing every image ref,
-//     would break authoring on such a deployment for no security gain.
+//   - neither wired             → EXTERNAL-IMAGE MODE (see the package doc):
+//     no storage adapter is configured at all, so there is no grammar with
+//     which to classify a reference and no signed URL can ever be minted. Refs
+//     are persisted verbatim, WITHOUT any ownership classification, and the
+//     tenant-isolation invariant is NOT enforced on this seam in this mode.
+//     That is a documented deployment shape, not a silent fail-open; the
+//     mode's positive guarantees (a durable ref can never be served, an
+//     http(s) ref renders only while fetchable) are spelled out in the
+//     package doc and pinned by TestCreateQuestion_ExternalImageMode_* below.
 //
 // Fail-loud: a foreign-tenant or unclassifiable reference is returned as an
 // error and the caller must abort before persisting.

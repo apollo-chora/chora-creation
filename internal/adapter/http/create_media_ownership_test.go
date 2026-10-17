@@ -295,46 +295,68 @@ func TestPatchQuestion_OwnTenantTransientRefReHomedInPlace(t *testing.T) {
 // The READ paths are gated too: a stored ref this tenant does not own is
 // dropped rather than signed. Defence in depth for a legacy row written before
 // the write seams were guarded — SignDownloadURL scopes on bucket only, and the
-// durable bucket is shared by every tenant.
+// durable bucket is shared by every tenant. The gate covers BOTH projections
+// (author + learner) and BOTH ref kinds: a foreign durable s3:// URI AND a
+// foreign TRANSIENT http(s) URL on the trusted origin (TenantOwnsRef
+// classifies both). Only the durable case can be detected without the
+// ownership-first ordering; the transient case passed straight through before
+// it.
 func TestReadPaths_ForeignTenantRefNotSigned(t *testing.T) {
 	srv, _ := newCountingS3Endpoint(t)
 	signer := newRealReHomer(t, srv.URL)
 
-	foreign := "s3://" + reHomeDurableBucket + "/tenants/someone-else/atoms/a1/secret.png"
-	router, qRepo, atomID := seedQuestionRefsDirectWithReHomer(t, signer, foreign, "")
-	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
-	if err != nil {
-		t.Fatalf("seed GetByAtomID: %v", err)
+	durableForeign := "s3://" + reHomeDurableBucket + "/tenants/someone-else/atoms/a1/secret.png"
+	transientForeign := "https://storage.googleapis.com/" + reHomeTransientBucket +
+		"/tenants/someone-else/jobs/j1/secret.png?X-Goog-Expires=604800"
+
+	// assertForeignDropped seeds the given ref directly and asserts BOTH HTTP
+	// projections drop it (never emit it raw, never sign it).
+	assertForeignDropped := func(t *testing.T, router http.Handler, qRepo *fakeQuestionRepository, atomID, where string) {
+		t.Helper()
+		q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+		if err != nil {
+			t.Fatalf("%s: seed GetByAtomID: %v", where, err)
+		}
+
+		// Author projection.
+		wa := httptest.NewRecorder()
+		router.ServeHTTP(wa, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+q.QuestionID, nil))
+		if wa.Code != http.StatusOK {
+			t.Fatalf("%s: author get: %d %s", where, wa.Code, wa.Body.String())
+		}
+		var author map[string]any
+		_ = json.Unmarshal(wa.Body.Bytes(), &author)
+		mcq := author["question"].(map[string]any)["mcq"].(map[string]any)
+		if s, _ := mcq["image_url"].(string); s != "" {
+			t.Errorf("%s: author projection image_url = %q; want the foreign ref dropped", where, s)
+		}
+
+		// Learner projection.
+		wl := httptest.NewRecorder()
+		router.ServeHTTP(wl, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
+		if wl.Code != http.StatusOK {
+			t.Fatalf("%s: learner get: %d %s", where, wl.Code, wl.Body.String())
+		}
+		var learner map[string]any
+		_ = json.Unmarshal(wl.Body.Bytes(), &learner)
+		qp, ok := learner["question_payload"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: expected question_payload; got %s", where, wl.Body.String())
+		}
+		if s, _ := qp["image_url"].(string); s != "" {
+			t.Errorf("%s: learner projection image_url = %q; want the foreign ref dropped", where, s)
+		}
 	}
 
-	// Author projection.
-	wa := httptest.NewRecorder()
-	router.ServeHTTP(wa, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+q.QuestionID, nil))
-	if wa.Code != http.StatusOK {
-		t.Fatalf("author get: %d %s", wa.Code, wa.Body.String())
-	}
-	var author map[string]any
-	_ = json.Unmarshal(wa.Body.Bytes(), &author)
-	mcq := author["question"].(map[string]any)["mcq"].(map[string]any)
-	if s, _ := mcq["image_url"].(string); s != "" {
-		t.Errorf("author projection image_url = %q; want the foreign ref dropped", s)
-	}
+	t.Run("durable s3 ref", func(t *testing.T) {
+		router, qRepo, atomID := seedQuestionRefsDirectWithReHomer(t, signer, durableForeign, "")
+		assertForeignDropped(t, router, qRepo, atomID, "durable")
+	})
 
-	// Learner projection.
-	wl := httptest.NewRecorder()
-	router.ServeHTTP(wl, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
-	if wl.Code != http.StatusOK {
-		t.Fatalf("learner get: %d %s", wl.Code, wl.Body.String())
-	}
-	var learner map[string]any
-	_ = json.Unmarshal(wl.Body.Bytes(), &learner)
-	qp, ok := learner["question_payload"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected question_payload; got %s", wl.Body.String())
-	}
-	if s, _ := qp["image_url"].(string); s != "" {
-		t.Errorf("learner projection image_url = %q; want the foreign ref dropped", s)
-	}
+	t.Run("transient http ref on the trusted origin", func(t *testing.T) {
+		router, qRepo, atomID := seedQuestionRefsDirectWithReHomer(t, signer, transientForeign, "")
+		assertForeignDropped(t, router, qRepo, atomID, "transient")
+	})
 }
 
 // The ACCEPT seam's ownership gate also runs with no copier wired. The re-homer
@@ -666,5 +688,87 @@ func TestCloneAtom_OwnTenantTransientRefBecomesDurable(t *testing.T) {
 	}
 	if srcRev.MCQPayload.ImageURL == nil || *srcRev.MCQPayload.ImageURL != own {
 		t.Errorf("source ref = %v; want the ORIGINAL %q untouched", deref(srcRev.MCQPayload.ImageURL), own)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// EXTERNAL-IMAGE MODE (neither re-homer nor download signer wired).
+//
+// With no storage adapter at all there is no grammar to classify a reference
+// with, so the write seam persists refs verbatim WITHOUT any ownership
+// classification. This is a documented deployment shape that does NOT enforce
+// the tenant-isolation invariant — these tests pin exactly what the mode does
+// and does not guarantee, so nobody mistakes it for an ownership pass.
+// -----------------------------------------------------------------------------
+
+// In external-image mode a foreign-tenant DURABLE ref is persisted verbatim —
+// no ownership classification is possible without a storage adapter. The
+// mode's one positive guarantee: with no signer nothing can mint the ref, so
+// the read projection drops it (the image never renders).
+func TestCreateQuestion_ExternalImageMode_ForeignDurableRefPersistedVerbatim(t *testing.T) {
+	_, requests := newCountingS3Endpoint(t)
+	router, qRepo, atomID := newOwnershipRouterWith(t, nil, nil)
+
+	foreign := "s3://" + reHomeDurableBucket + "/" + foreignTenantKey
+	w := postQuestion(t, router, atomID, ownershipMCQBody(foreign))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("external-image mode must persist the ref verbatim: create status=%d; want 201; body=%s", w.Code, w.Body.String())
+	}
+	if *requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0", *requests)
+	}
+	mcq := latestMCQ(t, qRepo, atomID)
+	if mcq.ImageURL == nil || *mcq.ImageURL != foreign {
+		t.Errorf("ImageURL = %v; want the verbatim ref %q (external-image mode classifies nothing)", deref(mcq.ImageURL), foreign)
+	}
+
+	// The mode's positive guarantee: with no signer the durable ref can never
+	// be served, so the learner projection drops it.
+	wl := httptest.NewRecorder()
+	router.ServeHTTP(wl, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
+	if wl.Code != http.StatusOK {
+		t.Fatalf("learner get: %d %s", wl.Code, wl.Body.String())
+	}
+	var learner map[string]any
+	_ = json.Unmarshal(wl.Body.Bytes(), &learner)
+	if qp, ok := learner["question_payload"].(map[string]any); ok {
+		if s, _ := qp["image_url"].(string); s != "" {
+			t.Errorf("learner projection image_url = %q; want the unmintable durable ref dropped", s)
+		}
+	}
+}
+
+// In external-image mode an http(s) ref is persisted verbatim AND served as
+// supplied — it is a URL its holder can already fetch, and with no signer
+// nothing rewrites or drops it. The mode documents this behaviour explicitly;
+// it is NOT an ownership pass (nothing classified the ref).
+func TestCreateQuestion_ExternalImageMode_TransientRefServedVerbatim(t *testing.T) {
+	router, qRepo, atomID := newOwnershipRouterWith(t, nil, nil)
+
+	transient := "https://storage.googleapis.com/" + reHomeTransientBucket +
+		"/tenants/someone-else/jobs/j1/secret.png?X-Goog-Expires=604800"
+	w := postQuestion(t, router, atomID, ownershipMCQBody(transient))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status=%d; want 201; body=%s", w.Code, w.Body.String())
+	}
+	mcq := latestMCQ(t, qRepo, atomID)
+	if mcq.ImageURL == nil || *mcq.ImageURL != transient {
+		t.Errorf("ImageURL = %v; want the verbatim ref %q", deref(mcq.ImageURL), transient)
+	}
+
+	// Served as supplied (no signer ⇒ nothing mints or drops it).
+	wl := httptest.NewRecorder()
+	router.ServeHTTP(wl, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
+	if wl.Code != http.StatusOK {
+		t.Fatalf("learner get: %d %s", wl.Code, wl.Body.String())
+	}
+	var learner map[string]any
+	_ = json.Unmarshal(wl.Body.Bytes(), &learner)
+	qp, ok := learner["question_payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected question_payload; got %s", wl.Body.String())
+	}
+	if qp["image_url"] != transient {
+		t.Errorf("image_url = %v; want the transient ref served verbatim in external-image mode", qp["image_url"])
 	}
 }
