@@ -20,6 +20,7 @@ package mediastore_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -248,5 +249,138 @@ func TestAtomMediaSigner_SignMintsPresignedURL(t *testing.T) {
 	}
 	if out.ExpiresAt.Before(time.Now()) {
 		t.Errorf("ExpiresAt = %v; want future", out.ExpiresAt)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Presign host selection — S3_PUBLIC_ENDPOINT.
+//
+// SigV4 signs the Host header, so a presigned URL minted against the
+// in-network service (e.g. garage:3900) cannot be fetched by the
+// author's/learner's browser. When S3_PUBLIC_ENDPOINT is set, BOTH sign
+// paths (Sign → PresignPutObject and SignDownloadURL → PresignGetObject)
+// share the presign client, so both must mint URLs naming the public host.
+// -----------------------------------------------------------------------------
+
+func TestAtomMediaSigner_PublicEndpoint_PutSignNamesPublicHost(t *testing.T) {
+
+	t.Setenv("S3_ENDPOINT", "http://garage:3900")
+	t.Setenv("S3_PUBLIC_ENDPOINT", "https://media.example.com")
+	t.Setenv("S3_ACCESS_KEY_ID", "test")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
+
+	signer, err := mediastore.NewAtomMediaSigner("chora-atom-media")
+	if err != nil {
+		t.Fatalf("NewAtomMediaSigner: %v", err)
+	}
+
+	out, err := signer.Sign(context.Background(), "atom-id", "tenant-id", ports.SignAtomMediaInput{
+		MIME:      "image/png",
+		SizeBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	u, err := url.Parse(out.UploadURL)
+	if err != nil {
+		t.Fatalf("UploadURL is not a valid URL: %v", err)
+	}
+	if u.Hostname() != "media.example.com" {
+		t.Errorf("UploadURL host = %q; want the public endpoint host media.example.com (url: %q)", u.Hostname(), out.UploadURL)
+	}
+	if u.Hostname() == "garage" {
+		t.Errorf("UploadURL still names the in-network host garage: %q", out.UploadURL)
+	}
+}
+
+func TestAtomMediaSigner_PublicEndpoint_GetSignNamesPublicHost(t *testing.T) {
+
+	t.Setenv("S3_ENDPOINT", "http://garage:3900")
+	t.Setenv("S3_PUBLIC_ENDPOINT", "https://media.example.com")
+	t.Setenv("S3_ACCESS_KEY_ID", "test")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
+
+	signer, err := mediastore.NewAtomMediaSigner("chora-atom-media")
+	if err != nil {
+		t.Fatalf("NewAtomMediaSigner: %v", err)
+	}
+
+	out, err := signer.SignDownloadURL(context.Background(), "s3://chora-atom-media/tenants/t1/atoms/a1/obj1.png")
+	if err != nil {
+		t.Fatalf("SignDownloadURL: %v", err)
+	}
+
+	u, err := url.Parse(out.URL)
+	if err != nil {
+		t.Fatalf("download URL is not a valid URL: %v", err)
+	}
+	if u.Hostname() != "media.example.com" {
+		t.Errorf("download URL host = %q; want the public endpoint host media.example.com (url: %q)", u.Hostname(), out.URL)
+	}
+}
+
+func TestAtomMediaSigner_PublicEndpoint_UnsetSignsInternalHost(t *testing.T) {
+
+	t.Setenv("S3_ENDPOINT", "http://garage:3900")
+	t.Setenv("S3_PUBLIC_ENDPOINT", "")
+	t.Setenv("S3_ACCESS_KEY_ID", "test")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
+
+	signer, err := mediastore.NewAtomMediaSigner("chora-atom-media")
+	if err != nil {
+		t.Fatalf("NewAtomMediaSigner: %v", err)
+	}
+
+	out, err := signer.Sign(context.Background(), "atom-id", "tenant-id", ports.SignAtomMediaInput{
+		MIME:      "image/png",
+		SizeBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	u, err := url.Parse(out.UploadURL)
+	if err != nil {
+		t.Fatalf("UploadURL is not a valid URL: %v", err)
+	}
+	// Today's behaviour preserved: unset ⇒ sign with S3_ENDPOINT (the
+	// documented dev / no-public-endpoint case).
+	if u.Hostname() != "garage" || u.Port() != "3900" {
+		t.Errorf("UploadURL host = %q; want the internal endpoint host garage:3900 (url: %q)", u.Host, out.UploadURL)
+	}
+}
+
+func TestAtomMediaSigner_PublicEndpoint_WithoutSchemeStillSignsPublicHost(t *testing.T) {
+
+	t.Setenv("S3_ENDPOINT", "http://garage:3900")
+	t.Setenv("S3_PUBLIC_ENDPOINT", "media.example.com")
+	t.Setenv("S3_ACCESS_KEY_ID", "test")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
+
+	signer, err := mediastore.NewAtomMediaSigner("chora-atom-media")
+	if err != nil {
+		t.Fatalf("NewAtomMediaSigner: %v", err)
+	}
+
+	out, err := signer.Sign(context.Background(), "atom-id", "tenant-id", ports.SignAtomMediaInput{
+		MIME:      "image/png",
+		SizeBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	// A scheme-less public endpoint is normalised to https:// by the same
+	// logic the internal endpoint uses — no construction failure.
+	u, err := url.Parse(out.UploadURL)
+	if err != nil {
+		t.Fatalf("UploadURL is not a valid URL: %v", err)
+	}
+	if u.Hostname() != "media.example.com" {
+		t.Errorf("UploadURL host = %q; want media.example.com (url: %q)", u.Hostname(), out.UploadURL)
+	}
+	if u.Scheme != "https" {
+		t.Errorf("UploadURL scheme = %q; want https", u.Scheme)
 	}
 }

@@ -142,6 +142,16 @@ type AtomMediaSigner struct {
 //
 // Both can be overridden per-call via WithTransientBucket /
 // WithTrustedPublicOrigin.
+//
+// S3_PUBLIC_ENDPOINT (optional) is the endpoint a BROWSER can reach. SigV4
+// signs the Host header, so a presigned URL minted against the in-network
+// service (e.g. garage:3900) cannot be fetched by the author's/learner's
+// browser — it must name the public host. When set and non-empty, the
+// PRESIGN client is derived from a second S3 client whose BaseEndpoint is
+// this public endpoint, so every minted URL names the reachable host. The
+// client used for actual API calls (upload/download/copy) keeps using
+// S3_ENDPOINT — only the signing host changes. Unset or empty ⇒ URLs keep
+// naming S3_ENDPOINT (dev / no-public-endpoint case).
 func NewAtomMediaSigner(bucket string, opts ...AtomMediaSignerOption) (*AtomMediaSigner, error) {
 	if strings.TrimSpace(bucket) == "" {
 		return nil, fmt.Errorf("atom-media S3 bucket not set: %w", ports.ErrAtomMediaSignerNotWired)
@@ -173,20 +183,32 @@ func NewAtomMediaSigner(bucket string, opts ...AtomMediaSignerOption) (*AtomMedi
 	}
 
 	// Ensure the endpoint has a scheme.
-	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
-		endpoint = "https://" + endpoint
-	}
+	endpoint = ensureScheme(endpoint)
 
-	client := s3.New(s3.Options{
+	apiOptions := s3.Options{
 		Region:       region,
 		BaseEndpoint: aws.String(endpoint),
 		UsePathStyle: usePathStyle,
 		Credentials:  credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
-	})
+	}
+	client := s3.New(apiOptions)
+
+	// The client whose endpoint ends up in the presigned URL. Signing is
+	// pure computation (no connection), so when a public endpoint is
+	// configured we sign with THAT host — otherwise the URL names the
+	// in-network service (e.g. garage:3900) and the author's/learner's
+	// browser cannot fetch it. Mirrors chora-ai-kernel-orchestrator's
+	// GcsImageUploadAdapter._resolve_signing_client.
+	signingClient := client
+	if publicEndpoint := strings.TrimSpace(os.Getenv("S3_PUBLIC_ENDPOINT")); publicEndpoint != "" {
+		signingOptions := apiOptions
+		signingOptions.BaseEndpoint = aws.String(ensureScheme(publicEndpoint))
+		signingClient = s3.New(signingOptions)
+	}
 
 	s := &AtomMediaSigner{
 		client:              client,
-		presign:             s3.NewPresignClient(client),
+		presign:             s3.NewPresignClient(signingClient),
 		bucket:              bucket,
 		signTimeout:         defaultSignTimeoutValue,
 		transientBucket:     strings.TrimSpace(os.Getenv("ATOM_MEDIA_TRANSIENT_BUCKET")),
@@ -196,6 +218,15 @@ func NewAtomMediaSigner(bucket string, opts ...AtomMediaSignerOption) (*AtomMedi
 		opt(s)
 	}
 	return s, nil
+}
+
+// ensureScheme prepends https:// when the endpoint carries no scheme, so
+// both the API client and the signing client parse a full URL.
+func ensureScheme(endpoint string) string {
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		return "https://" + endpoint
+	}
+	return endpoint
 }
 
 // Bucket returns the configured S3 bucket name (handy for the HTTP
