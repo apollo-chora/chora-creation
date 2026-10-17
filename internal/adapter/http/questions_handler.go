@@ -1012,13 +1012,14 @@ func (h *QuestionsHandler) getQuestion(w http.ResponseWriter, r *http.Request, a
 }
 
 // mintQuestionMedia returns a shallow copy of q whose MCQ/OE ImageURL +
-// AnswerImageURL durable gs:// refs are resolved to fresh signed GET URLs for
-// the authoring re-open path. Transient https refs pass through unchanged. On
-// a mint failure the ref is dropped (nil) and logged — a raw gs:// is NEVER
-// emitted to the wire — and the response is still served. A nil signer (tests /
-// unwired) makes this a no-op.
+// AnswerImageURL durable refs are resolved to fresh signed GET URLs for the
+// authoring re-open path. Transient http(s) refs pass through unchanged. On a
+// mint failure the ref is dropped (nil) and logged — and so is any ref that is
+// neither mintable nor fetchable — so a raw durable URI is NEVER emitted to the
+// wire. The response is still served. A nil signer (tests / unwired) still
+// drops durable refs rather than emitting them raw.
 func (h *QuestionsHandler) mintQuestionMedia(ctx context.Context, q *question.Question) *question.Question {
-	if q == nil || h.mediaDownloadSigner == nil {
+	if q == nil {
 		return q
 	}
 	out := *q
@@ -1037,20 +1038,30 @@ func (h *QuestionsHandler) mintQuestionMedia(ctx context.Context, q *question.Qu
 	return &out
 }
 
-// mintMediaRef resolves a single image ref: a durable gs:// ref is minted to a
-// fresh signed GET URL; a transient https ref (or empty/nil) passes through;
-// a mint failure drops the ref to nil (never a raw gs:// on the wire).
+// mintMediaRef resolves a single image ref: a durable atom-media ref (per the
+// signer's own IsDurableRef) is minted to a fresh signed GET URL; a transient
+// http(s) ref (or empty/nil) passes through; a mint failure — and any ref that
+// is neither mintable nor fetchable — is dropped to nil, never a raw durable URI
+// on the wire. This call site does not know the storage scheme.
 func (h *QuestionsHandler) mintMediaRef(ctx context.Context, ref *string) *string {
-	if ref == nil || *ref == "" || !strings.HasPrefix(*ref, "gs://") {
+	if ref == nil || *ref == "" {
 		return ref
 	}
-	signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
-	if err != nil {
-		log.Printf("getQuestion: mint atom-media gs-uri=%s: %v (dropping from author projection)", *ref, err)
-		return nil
+	if h.mediaDownloadSigner != nil && h.mediaDownloadSigner.IsDurableRef(*ref) {
+		signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
+		if err != nil {
+			log.Printf("getQuestion: mint atom-media ref=%s: %v (dropping from author projection)", *ref, err)
+			return nil
+		}
+		url := signed.URL
+		return &url
 	}
-	url := signed.URL
-	return &url
+	if isFetchableMediaRef(*ref) {
+		return ref
+	}
+	// Neither mintable nor fetchable (an unwired signer holding a durable ref, a
+	// foreign bucket, a malformed ref) — never emit it raw.
+	return nil
 }
 
 // -----------------------------------------------------------------------------

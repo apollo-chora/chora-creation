@@ -1192,32 +1192,44 @@ func (h *AtomHandler) projectAtomWithQuestion(ctx context.Context, a *atom.Learn
 	return envelope, nil
 }
 
-// signQuestionImage mints a durable gs:// QUESTION illustration ref to a fresh
-// short-lived signed GET URL for the LEARNER-safe projection. Mirrors the
+// signQuestionImage mints a durable atom-media QUESTION illustration ref to a
+// fresh short-lived signed GET URL for the LEARNER-safe projection. Mirrors the
 // author getQuestion mint (questions_handler.mintMediaRef) but is ONLY ever
 // called with the QUESTION image — the model-answer illustration is never
-// projected to learners (Security-wins). A transient https ref passes through;
+// projected to learners (Security-wins). A transient http(s) ref passes through;
 // a nil/empty ref, an unwired signer, or a mint failure drops the ref to nil so
-// a raw gs:// is NEVER emitted to the wire.
+// a raw durable URI is NEVER emitted to the wire. Whether a ref is durable is
+// the SIGNER's answer (IsDurableRef) — this call site does not know the storage
+// scheme.
 func (h *AtomHandler) signQuestionImage(ctx context.Context, ref *string) *string {
 	if ref == nil || *ref == "" {
 		return nil
 	}
-	if !strings.HasPrefix(*ref, "gs://") {
-		// Transient https ref (draft, pre-publish) — already fetchable.
+	if h.mediaDownloadSigner != nil && h.mediaDownloadSigner.IsDurableRef(*ref) {
+		signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
+		if err != nil {
+			log.Printf("getAtom: mint learner question-image ref=%s: %v (dropping)", *ref, err)
+			return nil
+		}
+		url := signed.URL
+		return &url
+	}
+	if isFetchableMediaRef(*ref) {
+		// Transient http(s) ref (draft, pre-publish) — already fetchable.
 		return ref
 	}
-	if h.mediaDownloadSigner == nil {
-		// No signer wired — never emit a raw gs:// to a learner.
-		return nil
-	}
-	signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
-	if err != nil {
-		log.Printf("getAtom: mint learner question-image gs-uri=%s: %v (dropping)", *ref, err)
-		return nil
-	}
-	url := signed.URL
-	return &url
+	// Neither mintable nor fetchable — an unwired signer holding a durable ref,
+	// a foreign bucket, a malformed ref. Never emit it raw.
+	return nil
+}
+
+// isFetchableMediaRef reports whether ref is already an http(s) URL the browser
+// can fetch directly — the transient signed-URL shape the orchestrator stamps on
+// a draft. A durable atom-media ref is NOT fetchable: it must be minted by the
+// download signer, or dropped. Read paths ask this instead of testing a storage
+// scheme themselves.
+func isFetchableMediaRef(ref string) bool {
+	return strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://")
 }
 
 // oeMaxScore returns the OE max achievable score. Derived from the

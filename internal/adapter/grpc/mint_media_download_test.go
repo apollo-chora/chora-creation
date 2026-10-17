@@ -32,6 +32,13 @@ func (f *fakeDownloadSigner) SignDownloadURL(_ context.Context, gsURI string) (p
 	}, nil
 }
 
+// IsDurableRef mirrors the double's signing scope. MintAtomMediaDownloadURL
+// calls SignDownloadURL directly (no grammar gate), so this exists only to
+// satisfy ports.AtomMediaDownloadSigner.
+func (f *fakeDownloadSigner) IsDurableRef(ref string) bool {
+	return strings.HasPrefix(ref, "gs://chora-atom-media-dev/")
+}
+
 // Batch mint — all valid refs return signed URLs in request order.
 func TestMintAtomMediaDownloadURL_BatchHappyPath(t *testing.T) {
 	srv := NewCreationServer(Deps{DownloadSigner: &fakeDownloadSigner{}})

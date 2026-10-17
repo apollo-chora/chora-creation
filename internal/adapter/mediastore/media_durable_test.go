@@ -341,6 +341,45 @@ func TestClassifyReference_Malformed_Errors(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// IsDurableRef — the read paths' "must this be minted?" predicate.
+// -----------------------------------------------------------------------------
+
+// IsDurableRef is true only for a well-formed s3:// ref on the configured
+// durable bucket — the exact set SignDownloadURL can sign. An http(s) URL, an
+// empty string, a foreign bucket, a malformed ref, and a gs:// ref (a scheme
+// this adapter cannot sign) are all NOT durable.
+func TestAtomMediaSigner_IsDurableRef(t *testing.T) {
+	signer := newTestSigner(t)
+
+	durable := "s3://" + testDurableBucket + "/tenants/t1/atoms/a1/obj.png"
+	if !signer.IsDurableRef(durable) {
+		t.Errorf("IsDurableRef(%q) = false; want true", durable)
+	}
+	// The predicate must agree with the signer: whatever it calls durable,
+	// SignDownloadURL must actually be able to mint.
+	if _, err := signer.SignDownloadURL(context.Background(), durable); err != nil {
+		t.Errorf("IsDurableRef said true but SignDownloadURL(%q) failed: %v", durable, err)
+	}
+
+	for _, ref := range []string{
+		"",
+		"   ",
+		"https://storage.googleapis.com/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?X-Goog-Expires=1",
+		"http://146.235.20.25:9000/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?X-Amz-Signature=d",
+		"s3://some-other-bucket/tenants/t1/atoms/a1/obj.png",
+		"s3://" + testDurableBucket,
+		"s3://" + testDurableBucket + "/",
+		"s3://",
+		"gs://" + testDurableBucket + "/tenants/t1/atoms/a1/obj.png",
+		"not a url at all ::::",
+	} {
+		if signer.IsDurableRef(ref) {
+			t.Errorf("IsDurableRef(%q) = true; want false", ref)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
 // CopyToDurable — pins the s3:// URI contract the re-home service persists.
 // -----------------------------------------------------------------------------
 

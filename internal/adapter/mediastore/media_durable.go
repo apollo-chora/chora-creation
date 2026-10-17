@@ -7,6 +7,8 @@
 //     satisfies the reference-kind half of ports.MediaReHomer.
 //   - CopyToDurable: server-side copy of a transient image object into the
 //     durable bucket (satisfies ports.MediaReHomer).
+//   - IsDurableRef: reports whether a stored ref is a durable atom-media
+//     object this adapter can mint a signed GET URL for.
 //   - SignDownloadURL: mints a fresh short-lived presigned GET URL over a
 //     durable s3:// object (satisfies ports.AtomMediaDownloadSigner).
 //
@@ -169,6 +171,26 @@ func (s *AtomMediaSigner) CopyToDurable(ctx context.Context, p ports.CopyToDurab
 			p.SrcBucket, p.SrcKey, s.bucket, dstKey, err)
 	}
 	return AtomMediaURI(s.bucket, dstKey), nil
+}
+
+// IsDurableRef reports whether ref names a durable atom-media object this
+// adapter can mint a signed GET URL for: a well-formed
+// `s3://<durable bucket>/<key>` URI.
+//
+// The accepted scheme set is deliberately exactly what SignDownloadURL can
+// sign — `s3://` only, because parseS3URI accepts nothing else. Reporting a
+// `gs://` durable ref as durable here would hand the signer a ref it always
+// refuses, and a caller could no longer tell "this deployment cannot mint
+// that" from "this needs no minting". A `gs://` ref is therefore NOT durable
+// for this adapter, and the read paths drop any non-durable ref that is not
+// an already-fetchable http(s) URL rather than emitting it raw — so a
+// deployment still holding a gs:// ref loses nothing.
+//
+// False for an http(s) URL, an empty string, a foreign bucket, and a
+// malformed ref. Reuses parseS3URI — one grammar, not two.
+func (s *AtomMediaSigner) IsDurableRef(ref string) bool {
+	bucket, _, err := parseS3URI(strings.TrimSpace(ref))
+	return err == nil && bucket == s.bucket
 }
 
 // SignDownloadURL mints a fresh short-lived presigned GET URL over the
