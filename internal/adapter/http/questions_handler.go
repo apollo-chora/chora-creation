@@ -821,6 +821,26 @@ func (h *QuestionsHandler) createQuestion(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// 2b. ADR-210 — the same media treatment the publish, save-revision and
+	// accept seams apply, on the CREATE seam too. Every image ref this handler
+	// can persist (mcq/oe image_url + answer_image_url) is classified and
+	// ownership-checked against the caller's own tenant namespace BEFORE
+	// anything is written: a foreign-tenant ref — durable OR transient — is
+	// refused here, so no question row, no revision and no S3 copy result. An
+	// own-tenant transient ref is re-homed to a durable one in place, so it
+	// survives the 7-day transient TTL instead of 404ing after it. Fail-loud,
+	// with the same envelope as the other seams. In production the re-homer and
+	// the read signer are wired from the same adapter, so a nil re-homer also
+	// means nothing can be signed (the read path drops durable refs).
+	if h.reHomer != nil {
+		if err := h.reHomer.ReHomePayloadImages(r.Context(), tenantID, atomID, qType, mcq, oe); err != nil {
+			log.Printf("questions: media re-home (create): %v", err)
+			writeError(w, http.StatusInternalServerError, "CREATION_ATOM_MEDIA_REHOME_FAILED",
+				"failed to durably re-home images")
+			return
+		}
+	}
+
 	// 3. Construct the aggregate + first revision.
 	q, err := question.New(question.NewParams{
 		TenantID:   tenantID,
@@ -918,6 +938,22 @@ func (h *QuestionsHandler) patchQuestion(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	// ADR-210 — the same media treatment the other seams apply, moved BEFORE
+	// the append so a rejected reference leaves no revision behind. Every ref
+	// this edit can introduce is classified and ownership-checked against the
+	// caller's own tenant namespace, and an own-tenant transient ref is
+	// re-homed in place — so the revision appended below already carries a
+	// durable ref. A foreign-tenant ref (durable OR transient) fails loud HERE,
+	// before AppendRevision: no revision row, no S3 copy. Fail-loud.
+	if h.reHomer != nil {
+		if err := h.reHomer.ReHomePayloadImages(r.Context(), tenantID, atomID, q.Type, mcq, oe); err != nil {
+			log.Printf("questions: media re-home (patch): %v", err)
+			writeError(w, http.StatusInternalServerError, "CREATION_ATOM_MEDIA_REHOME_FAILED",
+				"failed to durably re-home images")
+			return
+		}
+	}
+
 	// Apply the update. ApplyUpdate produces a NEW *Question + a new *QuestionRevision.
 	updated, newRev, err := q.ApplyUpdate(question.UpdateParams{
 		Prompt:     req.Prompt,
@@ -942,12 +978,15 @@ func (h *QuestionsHandler) patchQuestion(w http.ResponseWriter, r *http.Request,
 	updated.LatestRevisionID = newRev.RevisionID
 	updated.Revision = newRev.RevisionNumber
 
-	// ADR-210 — durably re-home the revision's transient W8 images into
-	// chora-atom-media at save, so a saved-but-unpublished image survives the
-	// 7-day transient bucket TTL (completes CHO-1974). Append-only: on a
-	// rewrite this appends a further revision carrying the durable object refs
-	// (reference-level idempotent — an already-durable ref is a no-op; the
-	// bytes are not deduplicated). Fail-loud.
+	// ADR-210 — second pass over the APPENDED revision. After the pre-append
+	// re-home above its refs are already durable, so this is normally a no-op;
+	// it still repairs the one path that bypasses it — a payload-omitting edit
+	// (mcq_payload/oe_payload absent ⇒ the previous revision's payload is
+	// carried forward), whose refs the pre-append pass never saw. That path
+	// carries no NEW caller-supplied ref, so it cannot introduce a foreign one;
+	// it can only re-persist a ref already stored. Reference-level idempotent —
+	// an already-durable ref is a no-op; the bytes are not deduplicated.
+	// Fail-loud.
 	if h.reHomer != nil {
 		rehomed, changed, rerr := h.reHomer.ReHomeRevision(r.Context(), tenantID, atomID, updated, newRev)
 		if rerr != nil {
