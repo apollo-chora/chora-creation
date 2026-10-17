@@ -62,11 +62,31 @@ type AtomMediaDownloadSigner interface {
 	// the browser can already fetch.
 	IsDurableRef(ref string) bool
 
+	// TenantOwnsRef reports whether ref names a media object inside tenantID's
+	// OWN per-tenant namespace (ports.TenantMediaPrefix) — the ownership gate
+	// every seam that persists or serves a media reference must pass.
+	//
+	// Implementations own the reference grammar: they classify ref and compare
+	// the resulting object key against the tenant prefix. Returns (true, nil)
+	// for a well-formed reference in the tenant's namespace, (false, nil) for a
+	// well-formed reference belonging to a DIFFERENT tenant, and (false, err)
+	// when the reference cannot be classified at all — ownership cannot be
+	// established, so the caller must fail closed.
+	//
+	// It exists so a caller can enforce ownership WITHOUT a copier: the mint
+	// RPC and the write seams whose re-homer is unwired still need the check,
+	// and neither should parse storage URI grammar itself.
+	TenantOwnsRef(ctx context.Context, tenantID, ref string) (bool, error)
+
 	// SignDownloadURL parses a durable object URI (`s3://{bucket}/{key}` for
 	// the S3 adapter), validates {bucket} is the configured durable
 	// atom-media bucket (refuses any other bucket — a caller MUST NOT be
 	// able to coerce the signer into vending a URL for an arbitrary
 	// bucket), and returns a fresh signed GET URL.
+	//
+	// It does NOT check tenant ownership of {key} — SignDownloadURL scopes on
+	// bucket only. Callers serving a tenant-scoped request MUST gate on
+	// TenantOwnsRef first.
 	//
 	// Returns an error for a malformed URI, a foreign bucket, or when the
 	// signer is not wired (ErrAtomMediaDownloadSignerNotWired).

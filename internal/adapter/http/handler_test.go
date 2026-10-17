@@ -854,24 +854,11 @@ func TestGetAtom_TransientImagePassesThrough(t *testing.T) {
 		called = true
 		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
 	}}
-	srv, atomID := seedMCQAtomWithSigner(t, signer)
 	transient := "https://storage.googleapis.com/chora-ai-assist-images-dev/x.png?X-Goog-Expires=604800"
-	body := map[string]any{
-		"type":   "mcq",
-		"prompt": "p",
-		"mcq_payload": map[string]any{
-			"options": []map[string]any{
-				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
-				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
-			},
-		},
-		"image_url": transient,
-	}
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("seed q: %d %s", w.Code, w.Body.String())
-	}
+	// Seeded DIRECTLY: this ref carries no tenant namespace, so the create seam
+	// refuses it. The learner projection must still pass a fetchable http(s) ref
+	// through unchanged, so the fixture writes the stored row directly.
+	srv, _, atomID := seedQuestionRefsDirect(t, signer, transient, "")
 	w2 := httptest.NewRecorder()
 	srv.ServeHTTP(w2, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
 	if w2.Code != http.StatusOK {
@@ -905,24 +892,10 @@ func TestGetAtom_LegacyGSRefDropped(t *testing.T) {
 		called = true
 		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
 	}}
-	srv, atomID := seedMCQAtomWithSigner(t, signer)
 	legacy := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
-	body := map[string]any{
-		"type":   "mcq",
-		"prompt": "p",
-		"mcq_payload": map[string]any{
-			"options": []map[string]any{
-				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
-				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
-			},
-		},
-		"image_url": legacy,
-	}
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("seed q: %d %s", w.Code, w.Body.String())
-	}
+	// Seeded DIRECTLY: the create seam now refuses a legacy scheme, so the
+	// learner projection has to be exercised against a stored legacy row.
+	srv, _, atomID := seedQuestionRefsDirect(t, signer, legacy, "")
 	w2 := httptest.NewRecorder()
 	srv.ServeHTTP(w2, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
 	if w2.Code != http.StatusOK {

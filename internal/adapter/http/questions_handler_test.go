@@ -17,9 +17,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -905,6 +907,32 @@ func (f fakeDownloadSigner) IsDurableRef(ref string) bool {
 	return ok && bucket == "chora-atom-media-dev" && key != ""
 }
 
+// TenantOwnsRef mirrors the adapter's ownership gate: the ref's object key must
+// sit under the caller's own tenants/{tenantID}/ namespace.
+func (f fakeDownloadSigner) TenantOwnsRef(_ context.Context, tenantID, ref string) (bool, error) {
+	key, ok := fakeMediaKey(ref)
+	if !ok {
+		return false, fmt.Errorf("unclassifiable media reference %q", ref)
+	}
+	return strings.HasPrefix(key, ports.TenantMediaPrefix(tenantID)), nil
+}
+
+// fakeMediaKey extracts the object key from the reference shapes this double
+// accepts — `s3://chora-atom-media-dev/<key>` and a path-style
+// `https://storage.googleapis.com/chora-ai-assist-images-dev/<key>`.
+func fakeMediaKey(ref string) (string, bool) {
+	if rest, ok := strings.CutPrefix(ref, "s3://"); ok {
+		bucket, key, ok := strings.Cut(rest, "/")
+		return key, ok && bucket == "chora-atom-media-dev" && key != ""
+	}
+	u, err := url.Parse(ref)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", false
+	}
+	bucket, key, ok := strings.Cut(strings.TrimPrefix(u.Path, "/"), "/")
+	return key, ok && bucket == "chora-ai-assist-images-dev" && key != ""
+}
+
 // syncLogBuffer is a race-safe io.Writer for capturing the standard logger
 // while sibling tests log concurrently.
 type syncLogBuffer struct {
@@ -1022,6 +1050,35 @@ func TestGetQuestionByID_MintsDurableImageRefs(t *testing.T) {
 	}
 }
 
+// seedQuestionRefsDirect seeds an MCQ atom + question carrying the given image
+// refs DIRECTLY into the repo, bypassing the create seam.
+//
+// The read-path tests below need a STORED ref the write seam would now refuse —
+// a legacy gs:// ref, a foreign bucket, or a bare transient URL with no tenant
+// namespace. The projection must still be exercised against exactly those, so
+// the fixture writes the row the way legacy data looks rather than through the
+// guarded POST route.
+func seedQuestionRefsDirect(t *testing.T, signer ports.AtomMediaDownloadSigner, img, ans string) (http.Handler, ports.QuestionRepository, string) {
+	t.Helper()
+	atomRepo := inmem.NewAtomRepository()
+	qRepo := newFakeQRepo()
+	a, err := atom.New(atom.NewParams{
+		TenantID: tenantA, Gcid: gcidA, Title: "Img atom", Body: "b", Mode: atom.ModeStraightUp,
+	})
+	if err != nil {
+		t.Fatalf("seed atom: %v", err)
+	}
+	a.QuestionType = atom.AtomType("mcq")
+	if err := atomRepo.Save(context.Background(), a); err != nil {
+		t.Fatalf("save atom: %v", err)
+	}
+	seedMCQWithImages(t, qRepo, a.AtomID, img, ans)
+	srv := httpadapter.NewRouterWithDeps(httpadapter.RouterDeps{
+		Repo: atomRepo, QuestionRepository: qRepo, AtomMediaDownloadSigner: signer,
+	})
+	return srv, qRepo, a.AtomID
+}
+
 // A transient https ref (draft atom, pre-publish) must pass through unchanged
 // and the signer must NOT be invoked for it.
 func TestGetQuestionByID_PassesThroughTransientHTTPS(t *testing.T) {
@@ -1031,29 +1088,15 @@ func TestGetQuestionByID_PassesThroughTransientHTTPS(t *testing.T) {
 		called = true
 		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
 	}}
-	srv, atomID := seedMCQAtomWithSigner(t, signer)
 	transient := "https://storage.googleapis.com/chora-ai-assist-images-dev/x.png?X-Goog-Expires=604800"
-	body := map[string]any{
-		"type":   "mcq",
-		"prompt": "p",
-		"mcq_payload": map[string]any{
-			"options": []map[string]any{
-				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
-				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
-			},
-		},
-		"image_url": transient,
+	srv, qRepo, atomID := seedQuestionRefsDirect(t, signer, transient, "")
+
+	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("seed GetByAtomID: %v", err)
 	}
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", w.Code, w.Body.String())
-	}
-	var created map[string]any
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
-	qID := created["question"].(map[string]any)["question_id"].(string)
 	w2 := httptest.NewRecorder()
-	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+qID, nil))
+	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+q.QuestionID, nil))
 	var fetched map[string]any
 	_ = json.Unmarshal(w2.Body.Bytes(), &fetched)
 	mcq := fetched["question"].(map[string]any)["mcq"].(map[string]any)
@@ -1113,26 +1156,15 @@ func TestGetQuestionByID_ForeignBucketRefDropped(t *testing.T) {
 		called = true
 		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
 	}}
-	srv, atomID := seedMCQAtomWithSigner(t, signer)
 	foreign := "s3://some-other-bucket/tenants/" + tenantA + "/atoms/x/stem.png"
-	body := map[string]any{
-		"type":   "mcq",
-		"prompt": "p",
-		"mcq_payload": map[string]any{
-			"options": []map[string]any{
-				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
-				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
-			},
-		},
-		"image_url": foreign,
+	srv, qRepo, atomID := seedQuestionRefsDirect(t, signer, foreign, "")
+
+	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("seed GetByAtomID: %v", err)
 	}
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
-	var created map[string]any
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
-	qID := created["question"].(map[string]any)["question_id"].(string)
 	w2 := httptest.NewRecorder()
-	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+qID, nil))
+	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+q.QuestionID, nil))
 	if w2.Code != http.StatusOK {
 		t.Fatalf("get: %d %s", w2.Code, w2.Body.String())
 	}
@@ -1158,29 +1190,15 @@ func TestGetQuestionByID_LegacyGSRefDropped(t *testing.T) {
 		called = true
 		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
 	}}
-	srv, atomID := seedMCQAtomWithSigner(t, signer)
 	legacy := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
-	body := map[string]any{
-		"type":   "mcq",
-		"prompt": "p",
-		"mcq_payload": map[string]any{
-			"options": []map[string]any{
-				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
-				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
-			},
-		},
-		"image_url": legacy,
+	srv, qRepo, atomID := seedQuestionRefsDirect(t, signer, legacy, "")
+
+	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("seed GetByAtomID: %v", err)
 	}
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", w.Code, w.Body.String())
-	}
-	var created map[string]any
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
-	qID := created["question"].(map[string]any)["question_id"].(string)
 	w2 := httptest.NewRecorder()
-	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+qID, nil))
+	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+q.QuestionID, nil))
 	if w2.Code != http.StatusOK {
 		t.Fatalf("get: %d %s", w2.Code, w2.Body.String())
 	}
@@ -1196,6 +1214,12 @@ func TestGetQuestionByID_LegacyGSRefDropped(t *testing.T) {
 	}
 	if called {
 		t.Errorf("signer must NOT be asked to sign a scheme it cannot mint")
+	}
+	// The stored reference itself is untouched — only the projection drops it.
+	if _, rev, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID); err != nil {
+		t.Fatalf("GetByAtomID: %v", err)
+	} else if rev.MCQPayload == nil || rev.MCQPayload.ImageURL == nil || *rev.MCQPayload.ImageURL != legacy {
+		t.Errorf("stored ref = %v; want the legacy ref %q untouched", rev.MCQPayload, legacy)
 	}
 }
 

@@ -39,6 +39,16 @@ func (f *fakeDownloadSigner) IsDurableRef(ref string) bool {
 	return strings.HasPrefix(ref, "gs://chora-atom-media-dev/")
 }
 
+// TenantOwnsRef mirrors the adapter's ownership gate: the ref's object key must
+// sit under the caller's own tenants/{tenantID}/ namespace.
+func (f *fakeDownloadSigner) TenantOwnsRef(_ context.Context, tenantID, ref string) (bool, error) {
+	key, ok := strings.CutPrefix(ref, "gs://chora-atom-media-dev/")
+	if !ok || key == "" {
+		return false, fmt.Errorf("unclassifiable media reference %q", ref)
+	}
+	return strings.HasPrefix(key, "tenants/"+tenantID+"/"), nil
+}
+
 // Batch mint — all valid refs return signed URLs in request order.
 func TestMintAtomMediaDownloadURL_BatchHappyPath(t *testing.T) {
 	srv := NewCreationServer(Deps{DownloadSigner: &fakeDownloadSigner{}})
@@ -69,6 +79,37 @@ func TestMintAtomMediaDownloadURL_BatchHappyPath(t *testing.T) {
 		if u.GetExpiresAt() == nil {
 			t.Errorf("url[%d] expires_at nil on success", i)
 		}
+	}
+}
+
+// OWNERSHIP — a same-bucket URI belonging to ANOTHER tenant must not be signed.
+// SignDownloadURL scopes on bucket only, so without this check any caller could
+// supply its own tenant_id with a foreign object key and have it minted.
+func TestMintAtomMediaDownloadURL_ForeignTenantRefRefused(t *testing.T) {
+	srv := NewCreationServer(Deps{DownloadSigner: &fakeDownloadSigner{}})
+	in := &creationv1.MintAtomMediaDownloadURLRequest{
+		TenantId: "t1",
+		GsUris: []string{
+			"gs://chora-atom-media-dev/tenants/t1/atoms/a/ok.png",
+			"gs://chora-atom-media-dev/tenants/someone-else/atoms/a/secret.png",
+		},
+	}
+	resp, err := srv.MintAtomMediaDownloadURL(context.Background(), in)
+	if err != nil {
+		t.Fatalf("batch should not fail on a foreign ref: %v", err)
+	}
+	if len(resp.GetUrls()) != 2 {
+		t.Fatalf("got %d urls; want 2", len(resp.GetUrls()))
+	}
+	if resp.Urls[0].GetSignedUrl() == "" || resp.Urls[0].GetError() != "" {
+		t.Errorf("url[0] (own tenant) should succeed; got url=%q err=%q",
+			resp.Urls[0].GetSignedUrl(), resp.Urls[0].GetError())
+	}
+	if resp.Urls[1].GetSignedUrl() != "" {
+		t.Errorf("url[1] (foreign tenant) must NOT be signed; got %q", resp.Urls[1].GetSignedUrl())
+	}
+	if !strings.Contains(resp.Urls[1].GetError(), "tenant") {
+		t.Errorf("url[1] error = %q; want a tenant-ownership refusal", resp.Urls[1].GetError())
 	}
 }
 

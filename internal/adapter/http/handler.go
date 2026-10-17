@@ -396,6 +396,9 @@ func NewRouterWithDeps(deps RouterDeps) http.Handler {
 		)
 		// ADR-210 — durably re-home a candidate's transient images at accept.
 		h.jobsHandler.reHomer = reHomer
+		// ADR-210 — the same storage adapter's signer, so the accept seam's
+		// tenant ownership check still runs when the re-homer is unwired.
+		h.jobsHandler.SetMediaSigner(deps.AtomMediaDownloadSigner)
 		// P6 — BlobStore is optional. When nil the multipart batch path
 		// 503s; the JSON ai_draft path stays available.
 		h.jobsHandler.SetBlobStore(deps.BlobStore)
@@ -1131,7 +1134,7 @@ func (h *AtomHandler) projectAtomWithQuestion(ctx context.Context, a *atom.Learn
 		// take, active duel); the model-answer illustration
 		// (q.MCQ.AnswerImageURL) is NEVER read here, so it can never leak to a
 		// learner pre-grade (Security-wins).
-		signedQImg := h.signQuestionImage(ctx, q.MCQ.ImageURL)
+		signedQImg := h.signQuestionImage(ctx, a.TenantID, q.MCQ.ImageURL)
 		mcqEnvelope := map[string]any{
 			"question_id": q.QuestionID,
 			"prompt":      q.Prompt,
@@ -1201,11 +1204,11 @@ func (h *AtomHandler) projectAtomWithQuestion(ctx context.Context, a *atom.Learn
 // author getQuestion mint (questions_handler.mintMediaRef) but is ONLY ever
 // called with the QUESTION image — the model-answer illustration is never
 // projected to learners (Security-wins). A transient http(s) ref passes through;
-// a nil/empty ref, an unwired signer, or a mint failure drops the ref to nil so
-// a raw durable URI is NEVER emitted to the wire. Whether a ref is durable is
-// the SIGNER's answer (IsDurableRef) — this call site does not know the storage
-// scheme.
-func (h *AtomHandler) signQuestionImage(ctx context.Context, ref *string) *string {
+// a nil/empty ref, an unwired signer, a foreign-tenant ref, or a mint failure
+// drops the ref to nil so a raw durable URI is NEVER emitted to the wire.
+// Whether a ref is durable is the SIGNER's answer (IsDurableRef) — this call
+// site does not know the storage scheme.
+func (h *AtomHandler) signQuestionImage(ctx context.Context, tenantID string, ref *string) *string {
 	if ref == nil || *ref == "" {
 		return nil
 	}
@@ -1229,6 +1232,15 @@ func (h *AtomHandler) signQuestionImage(ctx context.Context, ref *string) *strin
 		if isFetchableMediaRef(*ref) {
 			return ref
 		}
+		return nil
+	}
+	// OWNERSHIP — SignDownloadURL scopes on BUCKET only, and the durable bucket
+	// is shared by every tenant, so a stored ref is served only when this
+	// tenant owns its object key. Defence in depth against a legacy row that
+	// predates the write-seam guards.
+	if owns, oerr := h.mediaDownloadSigner.TenantOwnsRef(ctx, tenantID, *ref); oerr != nil || !owns {
+		log.Printf("getAtom: dropping question image ref %s from the learner projection — not owned by tenant %q (err=%v)",
+			redactMediaRef(*ref), tenantID, oerr)
 		return nil
 	}
 	signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)

@@ -9,6 +9,9 @@
 //     durable bucket (satisfies ports.MediaReHomer).
 //   - IsDurableRef: reports whether a stored ref is a durable atom-media
 //     object this adapter can mint a signed GET URL for.
+//   - TenantOwnsRef: reports whether a stored ref's object key lives in a
+//     given tenant's own namespace — the ownership gate, independent of the
+//     bucket gate SignDownloadURL applies.
 //   - SignDownloadURL: mints a fresh short-lived presigned GET URL over a
 //     durable s3:// object (satisfies ports.AtomMediaDownloadSigner).
 //
@@ -316,6 +319,28 @@ func (s *AtomMediaSigner) CopyToDurable(ctx context.Context, p ports.CopyToDurab
 func (s *AtomMediaSigner) IsDurableRef(ref string) bool {
 	bucket, _, err := parseS3URI(strings.TrimSpace(ref))
 	return err == nil && bucket == s.bucket
+}
+
+// TenantOwnsRef reports whether ref names a media object inside tenantID's own
+// per-tenant namespace (ports.TenantMediaPrefix).
+//
+// This is the OWNERSHIP gate, separate from the BUCKET gate SignDownloadURL
+// applies: the durable bucket is shared by every tenant, so a caller that knows
+// another tenant's object key could otherwise have it signed. It reuses
+// ClassifyReference for the grammar, so a transient `http(s)` reference is
+// checked exactly like a durable one.
+//
+// Returns (false, err) when the reference cannot be classified — ownership
+// cannot be established, so the caller must fail closed.
+func (s *AtomMediaSigner) TenantOwnsRef(ctx context.Context, tenantID, ref string) (bool, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return false, errors.New("atom-media: TenantOwnsRef requires a tenantID")
+	}
+	classified, err := s.ClassifyReference(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	return strings.HasPrefix(classified.Key, ports.TenantMediaPrefix(tenantID)), nil
 }
 
 // SignDownloadURL mints a fresh short-lived presigned GET URL over the

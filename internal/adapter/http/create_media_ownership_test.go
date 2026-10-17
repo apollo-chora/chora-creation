@@ -10,6 +10,7 @@
 package httpadapter_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	mediastore "github.com/apollo-chora/chora-creation/internal/adapter/mediastore"
 	"github.com/apollo-chora/chora-creation/internal/domain/atom"
 	"github.com/apollo-chora/chora-creation/internal/domain/question"
+	"github.com/apollo-chora/chora-creation/internal/ports"
 )
 
 const foreignTenantKey = "tenants/someone-else/jobs/j1/secret.png"
@@ -30,6 +32,14 @@ const foreignTenantKey = "tenants/someone-else/jobs/j1/secret.png"
 // newOwnershipRouter wires the REAL S3 adapter as BOTH the re-homer and the
 // download signer over an MCQ atom, and returns the router + question repo.
 func newOwnershipRouter(t *testing.T, signer *mediastore.AtomMediaSigner) (http.Handler, *fakeQuestionRepository, string) {
+	t.Helper()
+	return newOwnershipRouterWith(t, signer, signer)
+}
+
+// newOwnershipRouterWith wires the given re-homer and signer over an MCQ atom.
+// Passing a nil re-homer models the "copier unwired" configuration the tenant
+// ownership gate must still protect.
+func newOwnershipRouterWith(t *testing.T, reHomer ports.MediaReHomer, signer ports.AtomMediaDownloadSigner) (http.Handler, *fakeQuestionRepository, string) {
 	t.Helper()
 	atomRepo := inmem.NewAtomRepository()
 	qRepo := newFakeQRepo()
@@ -45,7 +55,7 @@ func newOwnershipRouter(t *testing.T, signer *mediastore.AtomMediaSigner) (http.
 	}
 	router := httpadapter.NewRouterWithDeps(httpadapter.RouterDeps{
 		Repo: atomRepo, QuestionRepository: qRepo,
-		MediaReHomer: signer, AtomMediaDownloadSigner: signer,
+		MediaReHomer: reHomer, AtomMediaDownloadSigner: signer,
 	})
 	return router, qRepo, a.AtomID
 }
@@ -282,6 +292,112 @@ func TestPatchQuestion_OwnTenantTransientRefReHomedInPlace(t *testing.T) {
 	}
 }
 
+// The READ paths are gated too: a stored ref this tenant does not own is
+// dropped rather than signed. Defence in depth for a legacy row written before
+// the write seams were guarded — SignDownloadURL scopes on bucket only, and the
+// durable bucket is shared by every tenant.
+func TestReadPaths_ForeignTenantRefNotSigned(t *testing.T) {
+	srv, _ := newCountingS3Endpoint(t)
+	signer := newRealReHomer(t, srv.URL)
+
+	foreign := "s3://" + reHomeDurableBucket + "/tenants/someone-else/atoms/a1/secret.png"
+	router, qRepo, atomID := seedQuestionRefsDirectWithReHomer(t, signer, foreign, "")
+	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("seed GetByAtomID: %v", err)
+	}
+
+	// Author projection.
+	wa := httptest.NewRecorder()
+	router.ServeHTTP(wa, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+q.QuestionID, nil))
+	if wa.Code != http.StatusOK {
+		t.Fatalf("author get: %d %s", wa.Code, wa.Body.String())
+	}
+	var author map[string]any
+	_ = json.Unmarshal(wa.Body.Bytes(), &author)
+	mcq := author["question"].(map[string]any)["mcq"].(map[string]any)
+	if s, _ := mcq["image_url"].(string); s != "" {
+		t.Errorf("author projection image_url = %q; want the foreign ref dropped", s)
+	}
+
+	// Learner projection.
+	wl := httptest.NewRecorder()
+	router.ServeHTTP(wl, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
+	if wl.Code != http.StatusOK {
+		t.Fatalf("learner get: %d %s", wl.Code, wl.Body.String())
+	}
+	var learner map[string]any
+	_ = json.Unmarshal(wl.Body.Bytes(), &learner)
+	qp, ok := learner["question_payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected question_payload; got %s", wl.Body.String())
+	}
+	if s, _ := qp["image_url"].(string); s != "" {
+		t.Errorf("learner projection image_url = %q; want the foreign ref dropped", s)
+	}
+}
+
+// The ACCEPT seam's ownership gate also runs with no copier wired. The re-homer
+// and the download signer are derived from the same adapter in production, but
+// the handler must not be fail-open if only one is wired — this pins the
+// wiring (handler.go SetMediaSigner) and the shared guard.
+func TestAcceptQuestionJob_OwnershipEnforcedWithoutACopier(t *testing.T) {
+	srv, _ := newCountingS3Endpoint(t)
+	signer := newRealReHomer(t, srv.URL)
+
+	atomRepo := inmem.NewAtomRepository()
+	qRepo := newFakeQRepo()
+	jobRepo := newFakeJobRepo()
+	host, err := atom.New(atom.NewParams{
+		TenantID: tenantA, Gcid: gcidA, Title: "Host", Body: "Body", Mode: atom.ModeStraightUp,
+	})
+	if err != nil {
+		t.Fatalf("seed atom: %v", err)
+	}
+	host.QuestionType = atom.AtomType("mcq")
+	if err := atomRepo.Save(context.Background(), host); err != nil {
+		t.Fatalf("atomRepo.Save: %v", err)
+	}
+	cand := mcqCandidate("d1", "s3://"+reHomeDurableBucket+"/"+foreignTenantKey, "")
+	candJSON, err := json.Marshal([]map[string]any{cand})
+	if err != nil {
+		t.Fatalf("marshal candidate: %v", err)
+	}
+	job := &question.ComposeJob{
+		JobID: "01970000-0000-7000-8000-0000000ee0b2", AtomID: host.AtomID,
+		TenantID: tenantA, AuthorGCID: gcidA,
+		Intent: question.IntentNewQuestion, Status: question.JobStatusSucceeded,
+		CandidateQuestionsJSON: candJSON,
+	}
+	jobRepo.jobs[job.JobID] = job
+
+	// ONLY the download signer is wired — no MediaReHomer.
+	router := httpadapter.NewRouterWithDeps(httpadapter.RouterDeps{
+		Repo:                    atomRepo,
+		QuestionRepository:      qRepo,
+		QuestionJobRepository:   jobRepo,
+		ManaLedger:              &fakeManaLedger{successDebits: 10},
+		JobEventPublisher:       &fakeJobPublisher{},
+		AtomMediaDownloadSigner: signer,
+	})
+	body, _ := json.Marshal(map[string]any{"accepted_candidates": []map[string]any{{"draft_id": "d1"}}})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost,
+		"/api/atoms/"+host.AtomID+"/question-jobs/"+job.JobID+"/accept", bytes.NewReader(body))
+	r.Header.Set("X-Tenant-Id", tenantA)
+	r.Header.Set("gcid", gcidA)
+	r.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("accept status=%d; want 500; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "CREATION_ATOM_MEDIA_REHOME_FAILED") {
+		t.Errorf("body %s should carry CREATION_ATOM_MEDIA_REHOME_FAILED", w.Body.String())
+	}
+	assertNoQuestionPersisted(t, qRepo, host.AtomID)
+}
+
 // A question with no image at all is unaffected by the new guard.
 func TestCreateQuestion_NoImageUnaffected(t *testing.T) {
 	srv, requests := newCountingS3Endpoint(t)
@@ -303,5 +419,252 @@ func TestCreateQuestion_NoImageUnaffected(t *testing.T) {
 		t.Error("question was not persisted")
 	} else if err != nil {
 		t.Errorf("GetByAtomID: %v; want the question persisted", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// EVERY reference is validated BEFORE any copy.
+// -----------------------------------------------------------------------------
+
+// A legitimate stem ref must not be copied when the SIBLING answer ref is
+// foreign — otherwise the request fails having already left an unreferenced
+// durable object behind (an orphan the caller cannot clean up and must pay for
+// again on retry).
+func TestCreateQuestion_NoCopyWhenASiblingRefIsRejected(t *testing.T) {
+	srv, requests := newCountingS3Endpoint(t)
+	reHomer := newRealReHomer(t, srv.URL)
+	router, qRepo, atomID := newOwnershipRouter(t, reHomer)
+
+	body := ownershipMCQBody("https://storage.googleapis.com/" + reHomeTransientBucket +
+		"/tenants/" + tenantA + "/jobs/j1/stem.png?X-Goog-Expires=604800")
+	body["answer_image_url"] = "s3://" + reHomeDurableBucket + "/" + foreignTenantKey
+
+	w := postQuestion(t, router, atomID, body)
+	assertCreateRefused(t, w, qRepo, atomID)
+	if *requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0 — every ref must be validated BEFORE any copy", *requests)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// The OWNERSHIP gate does not depend on the copier being wired.
+// -----------------------------------------------------------------------------
+
+// With only the download signer wired (no re-homer) a foreign-tenant ref is
+// still refused: the check needs the storage adapter's grammar, not its copier.
+func TestCreateQuestion_OwnershipEnforcedWithoutACopier(t *testing.T) {
+	srv, requests := newCountingS3Endpoint(t)
+	signer := newRealReHomer(t, srv.URL)
+	router, qRepo, atomID := newOwnershipRouterWith(t, nil, signer)
+
+	foreign := "s3://" + reHomeDurableBucket + "/" + foreignTenantKey
+	w := postQuestion(t, router, atomID, ownershipMCQBody(foreign))
+	assertCreateRefused(t, w, qRepo, atomID)
+	if *requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0", *requests)
+	}
+}
+
+// With only the signer wired an OWN-tenant ref is still accepted — the copy is
+// simply skipped (there is no copier), and the ref is persisted as supplied.
+func TestCreateQuestion_OwnTenantRefAcceptedWithoutACopier(t *testing.T) {
+	srv, requests := newCountingS3Endpoint(t)
+	signer := newRealReHomer(t, srv.URL)
+	router, qRepo, atomID := newOwnershipRouterWith(t, nil, signer)
+
+	own := "s3://" + reHomeDurableBucket + "/tenants/" + tenantA + "/atoms/a1/obj.png"
+	w := postQuestion(t, router, atomID, ownershipMCQBody(own))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status=%d; want 201; body=%s", w.Code, w.Body.String())
+	}
+	if *requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0 (no copier)", *requests)
+	}
+	mcq := latestMCQ(t, qRepo, atomID)
+	if mcq.ImageURL == nil || *mcq.ImageURL != own {
+		t.Errorf("ImageURL = %v; want the unchanged ref %q", deref(mcq.ImageURL), own)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// PATCH: the payload-omitting edit carries the PREVIOUS refs forward, so the
+// pre-append guard must see them too.
+// -----------------------------------------------------------------------------
+
+// A prompt-only PATCH on a question holding a legacy foreign-tenant ref must be
+// refused WITHOUT appending a revision — otherwise the ref is re-persisted by
+// the very edit that was supposed to be rejected.
+func TestPatchQuestion_PayloadOmittedCarryForwardStillGuarded(t *testing.T) {
+	srv, requests := newCountingS3Endpoint(t)
+	reHomer := newRealReHomer(t, srv.URL)
+
+	// Seed a question whose STORED ref is foreign — a legacy row the write seam
+	// would refuse today, written directly.
+	foreign := "s3://" + reHomeDurableBucket + "/" + foreignTenantKey
+	srvRouter, qRepo, atomID := seedQuestionRefsDirectWithReHomer(t, reHomer, foreign, "")
+	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("seed GetByAtomID: %v", err)
+	}
+
+	// A prompt-only edit: mcq_payload omitted ⇒ the previous payload (and its
+	// foreign ref) is carried forward.
+	w := httptest.NewRecorder()
+	srvRouter.ServeHTTP(w, authedJSON(http.MethodPatch,
+		"/api/atoms/"+atomID+"/questions/"+q.QuestionID, map[string]any{"prompt": "edited"}))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("patch status=%d; want 500; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "CREATION_ATOM_MEDIA_REHOME_FAILED") {
+		t.Errorf("body %s should carry CREATION_ATOM_MEDIA_REHOME_FAILED", w.Body.String())
+	}
+	if *requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0", *requests)
+	}
+
+	_, rev, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("GetByAtomID: %v", err)
+	}
+	if rev.RevisionNumber != 1 {
+		t.Errorf("latest revision = %d; want 1 — the refused edit must not be appended", rev.RevisionNumber)
+	}
+}
+
+// A prompt-only PATCH on a question holding an own-tenant transient ref
+// re-homes it: the carried-forward ref is durabilised rather than expiring.
+func TestPatchQuestion_PayloadOmittedCarryForwardReHomed(t *testing.T) {
+	srv, requests := newCountingS3Endpoint(t)
+	reHomer := newRealReHomer(t, srv.URL)
+
+	own := "https://storage.googleapis.com/" + reHomeTransientBucket +
+		"/tenants/" + tenantA + "/jobs/j1/stem.png?X-Goog-Expires=604800"
+	srvRouter, qRepo, atomID := seedQuestionRefsDirectWithReHomer(t, reHomer, own, "")
+	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("seed GetByAtomID: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	srvRouter.ServeHTTP(w, authedJSON(http.MethodPatch,
+		"/api/atoms/"+atomID+"/questions/"+q.QuestionID, map[string]any{"prompt": "edited"}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch status=%d; want 200; body=%s", w.Code, w.Body.String())
+	}
+	if *requests != 1 {
+		t.Errorf("S3 endpoint received %d requests; want 1 (the re-home copy)", *requests)
+	}
+	_, rev, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("GetByAtomID: %v", err)
+	}
+	want := "s3://" + reHomeDurableBucket + "/tenants/" + tenantA + "/atoms/" + atomID + "/"
+	if rev.MCQPayload.ImageURL == nil || !strings.HasPrefix(*rev.MCQPayload.ImageURL, want) {
+		t.Errorf("persisted image ref = %v; want a durable %s<uuid>.png ref", deref(rev.MCQPayload.ImageURL), want)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// CLONE is a write seam.
+// -----------------------------------------------------------------------------
+
+// seedQuestionRefsDirectWithReHomer seeds an MCQ atom + question carrying the
+// given refs directly into the repo, and wires the given re-homer as both the
+// copier and the download signer.
+func seedQuestionRefsDirectWithReHomer(t *testing.T, signer *mediastore.AtomMediaSigner, img, ans string) (http.Handler, *fakeQuestionRepository, string) {
+	t.Helper()
+	atomRepo := inmem.NewAtomRepository()
+	qRepo := newFakeQRepo()
+	a, err := atom.New(atom.NewParams{
+		TenantID: tenantA, Gcid: gcidA, Title: "Clone source", Body: "b", Mode: atom.ModeStraightUp,
+	})
+	if err != nil {
+		t.Fatalf("seed atom: %v", err)
+	}
+	a.QuestionType = atom.AtomType("mcq")
+	if err := atomRepo.Save(context.Background(), a); err != nil {
+		t.Fatalf("save atom: %v", err)
+	}
+	seedMCQWithImages(t, qRepo, a.AtomID, img, ans)
+	srv := httpadapter.NewRouterWithDeps(httpadapter.RouterDeps{
+		Repo: atomRepo, QuestionRepository: qRepo,
+		MediaReHomer: signer, AtomMediaDownloadSigner: signer,
+	})
+	return srv, qRepo, a.AtomID
+}
+
+func cloneAtom(t *testing.T, router http.Handler, srcAtomID string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+srcAtomID+"/clone", map[string]any{}))
+	return w
+}
+
+// A source question carrying a FOREIGN ref must not be copied into a clone: the
+// source lookup is tenant-scoped, but that says nothing about the media refs the
+// stored row carries.
+func TestCloneAtom_ForeignTenantRefRefused(t *testing.T) {
+	srv, requests := newCountingS3Endpoint(t)
+	reHomer := newRealReHomer(t, srv.URL)
+
+	foreign := "s3://" + reHomeDurableBucket + "/" + foreignTenantKey
+	router, qRepo, srcAtomID := seedQuestionRefsDirectWithReHomer(t, reHomer, foreign, "")
+
+	w := cloneAtom(t, router, srcAtomID)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("clone status=%d; want 500; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "CREATION_ATOM_MEDIA_REHOME_FAILED") {
+		t.Errorf("body %s should carry CREATION_ATOM_MEDIA_REHOME_FAILED", w.Body.String())
+	}
+	if *requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0", *requests)
+	}
+	// The refusal happens BEFORE the clone atom is saved, so nothing new exists.
+	if _, _, err := qRepo.GetByAtomID(context.Background(), tenantA, srcAtomID); err != nil {
+		t.Errorf("source question lookup: %v", err)
+	}
+}
+
+// A source question carrying an own-tenant TRANSIENT ref is cloned with a
+// DURABLE ref — the clone must not inherit an image that expires with the
+// transient TTL.
+func TestCloneAtom_OwnTenantTransientRefBecomesDurable(t *testing.T) {
+	srv, requests := newCountingS3Endpoint(t)
+	reHomer := newRealReHomer(t, srv.URL)
+
+	own := "https://storage.googleapis.com/" + reHomeTransientBucket +
+		"/tenants/" + tenantA + "/jobs/j1/stem.png?X-Goog-Expires=604800"
+	router, qRepo, srcAtomID := seedQuestionRefsDirectWithReHomer(t, reHomer, own, "")
+
+	w := cloneAtom(t, router, srcAtomID)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("clone status=%d; want 201; body=%s", w.Code, w.Body.String())
+	}
+	if *requests != 1 {
+		t.Errorf("S3 endpoint received %d requests; want 1 (the clone's re-home copy)", *requests)
+	}
+	var cloned map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &cloned)
+	cloneID, _ := cloned["atom_id"].(string)
+	if cloneID == "" || cloneID == srcAtomID {
+		t.Fatalf("cloned atom id = %q; want a new atom", cloneID)
+	}
+	_, rev, err := qRepo.GetByAtomID(context.Background(), tenantA, cloneID)
+	if err != nil {
+		t.Fatalf("cloned question lookup: %v", err)
+	}
+	want := "s3://" + reHomeDurableBucket + "/tenants/" + tenantA + "/atoms/" + cloneID + "/"
+	if rev.MCQPayload.ImageURL == nil || !strings.HasPrefix(*rev.MCQPayload.ImageURL, want) {
+		t.Errorf("cloned image ref = %v; want a durable %s<uuid>.png ref", deref(rev.MCQPayload.ImageURL), want)
+	}
+
+	// The SOURCE question is never mutated by the clone's re-home.
+	_, srcRev, err := qRepo.GetByAtomID(context.Background(), tenantA, srcAtomID)
+	if err != nil {
+		t.Fatalf("source question lookup: %v", err)
+	}
+	if srcRev.MCQPayload.ImageURL == nil || *srcRev.MCQPayload.ImageURL != own {
+		t.Errorf("source ref = %v; want the ORIGINAL %q untouched", deref(srcRev.MCQPayload.ImageURL), own)
 	}
 }

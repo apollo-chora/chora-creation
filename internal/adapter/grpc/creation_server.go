@@ -629,14 +629,22 @@ func preferOE(parent *question.OEPayload, rev *question.QuestionRevision) *quest
 // -----------------------------------------------------------------------------
 
 // MintAtomMediaDownloadURL mints fresh short-lived V4 signed GET URLs for the
-// durable atom-media gs:// refs chora-delivery froze in the test-set snapshot.
+// durable atom-media refs chora-delivery froze in the test-set snapshot.
 // Batched + per-URI error isolation: one bad/stale ref returns an error in
 // its entry without failing the whole assessment load.
+//
+// OWNERSHIP: SignDownloadURL scopes on BUCKET only, and the durable bucket is
+// shared by every tenant — so a caller could otherwise hand in its own
+// tenant_id with ANOTHER tenant's object key and have it signed. Every URI is
+// therefore checked against the caller's tenant namespace first, via the
+// signer's own grammar (TenantOwnsRef); a foreign ref is refused per-URI,
+// exactly like a bad ref.
 func (s *CreationServer) MintAtomMediaDownloadURL(ctx context.Context, in *creationv1.MintAtomMediaDownloadURLRequest) (*creationv1.MintAtomMediaDownloadURLResponse, error) {
 	if s.downloadSigner == nil {
 		return nil, status.Error(codes.FailedPrecondition, "creation: atom-media download signer not wired (ATOM_MEDIA_BUCKET unset?)")
 	}
-	if in == nil || strings.TrimSpace(in.GetTenantId()) == "" {
+	tenantID := strings.TrimSpace(in.GetTenantId())
+	if in == nil || tenantID == "" {
 		return nil, status.Error(codes.InvalidArgument, "creation: tenant_id required")
 	}
 
@@ -645,13 +653,21 @@ func (s *CreationServer) MintAtomMediaDownloadURL(ctx context.Context, in *creat
 	}
 	for _, gsURI := range in.GetGsUris() {
 		entry := &creationv1.MintedMediaURL{GsUri: gsURI}
-		out, err := s.downloadSigner.SignDownloadURL(ctx, gsURI)
-		if err != nil {
+		switch owns, oerr := s.downloadSigner.TenantOwnsRef(ctx, tenantID, gsURI); {
+		case oerr != nil:
 			// Per-URI failure — record + continue (do not fail the batch).
-			entry.Error = err.Error()
-		} else {
-			entry.SignedUrl = out.URL
-			entry.ExpiresAt = timestamppb.New(out.ExpiresAt)
+			entry.Error = oerr.Error()
+		case !owns:
+			entry.Error = "creation: refusing to sign a media ref outside the caller's tenant namespace"
+		default:
+			out, err := s.downloadSigner.SignDownloadURL(ctx, gsURI)
+			if err != nil {
+				// Per-URI failure — record + continue (do not fail the batch).
+				entry.Error = err.Error()
+			} else {
+				entry.SignedUrl = out.URL
+				entry.ExpiresAt = timestamppb.New(out.ExpiresAt)
+			}
 		}
 		resp.Urls = append(resp.Urls, entry)
 	}

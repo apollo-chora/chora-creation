@@ -490,6 +490,56 @@ func TestAtomMediaSigner_IsDurableRef(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// TenantOwnsRef — the ownership gate, separate from the bucket gate.
+// -----------------------------------------------------------------------------
+
+// TenantOwnsRef is true only for a reference whose OBJECT KEY sits in the
+// caller's own tenants/{tenantID}/ namespace. The bucket gate is deliberately
+// not enough: the durable bucket is shared by every tenant.
+func TestAtomMediaSigner_TenantOwnsRef(t *testing.T) {
+	signer := newTestSignerWithTransient(t)
+
+	for _, tc := range []struct {
+		name     string
+		tenantID string
+		ref      string
+		want     bool
+	}{
+		{"own tenant durable", "t1", "s3://" + testDurableBucket + "/tenants/t1/atoms/a1/obj.png", true},
+		{"foreign tenant durable", "t1", "s3://" + testDurableBucket + "/tenants/someone-else/atoms/a1/obj.png", false},
+		{"tenant prefix boundary", "t1", "s3://" + testDurableBucket + "/tenants/t11/atoms/a1/obj.png", false},
+		{"own tenant transient", "t1",
+			"http://146.235.20.25:9000/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?sig=1", true},
+		{"foreign tenant transient", "t1",
+			"http://146.235.20.25:9000/" + testTransientBucket + "/tenants/someone-else/jobs/j9/x.png?sig=1", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := signer.TenantOwnsRef(context.Background(), tc.tenantID, tc.ref)
+			if err != nil {
+				t.Fatalf("TenantOwnsRef(%q) err = %v; want nil", tc.ref, err)
+			}
+			if got != tc.want {
+				t.Errorf("TenantOwnsRef(%q) = %v; want %v", tc.ref, got, tc.want)
+			}
+		})
+	}
+
+	// An unclassifiable ref cannot establish ownership — the caller must fail
+	// closed, so this is an error rather than a plain false.
+	for _, ref := range []string{"", "not a url at all ::::", "s3://", "ftp://x/y"} {
+		if _, err := signer.TenantOwnsRef(context.Background(), "t1", ref); err == nil {
+			t.Errorf("TenantOwnsRef(%q) should error (unclassifiable); got nil", ref)
+		}
+	}
+
+	// An empty tenant id can never own anything.
+	if _, err := signer.TenantOwnsRef(context.Background(), "  ",
+		"s3://"+testDurableBucket+"/tenants/t1/atoms/a1/obj.png"); err == nil {
+		t.Error("TenantOwnsRef with an empty tenantID should error; got nil")
+	}
+}
+
+// -----------------------------------------------------------------------------
 // CopyToDurable — pins the s3:// URI contract the re-home service persists.
 // -----------------------------------------------------------------------------
 

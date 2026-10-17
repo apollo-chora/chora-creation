@@ -42,36 +42,73 @@ func New(copier ports.MediaReHomer) *Service { return &Service{copier: copier} }
 // transient ones — see referenceBelongsToTenant. tenantID + atomID scope the
 // destination key. A publish that re-homes the same atom twice is a no-op the
 // second time (the stored ref is already durable), so re-publish is safe.
+//
+// ReHome is Check + Copy in one call. A caller holding SEVERAL references
+// should call Check on all of them first and only then Copy, so a rejected
+// later reference cannot leave an earlier copy orphaned.
 func (s *Service) ReHome(ctx context.Context, tenantID, atomID, imageURL string) (string, bool, error) {
 	raw := strings.TrimSpace(imageURL)
 	if raw == "" {
 		return "", false, nil
 	}
+	checked, err := s.Check(ctx, tenantID, raw)
+	if err != nil {
+		return "", false, err
+	}
+	return s.Copy(ctx, tenantID, atomID, checked)
+}
 
-	// The adapter owns storage-URL grammar + validation: it decides whether
-	// this ref is transient (copy it) or already durable (leave it). An
-	// unknown / malformed / foreign ref is an error, so we fail loud BEFORE
-	// any copy or persist.
+// CheckedReference is a reference that has been classified and had its tenant
+// ownership verified, but not yet copied.
+type CheckedReference struct {
+	// Raw is the reference as supplied, trimmed.
+	Raw string
+
+	// Kind is Transient (copy it) or Durable (already durable — Copy is a
+	// no-op returning Raw).
+	Kind ports.MediaReferenceKind
+
+	// Bucket / Key are the classified object coordinates.
+	Bucket string
+	Key    string
+}
+
+// Check classifies raw and verifies that tenantID owns the object, WITHOUT
+// copying anything.
+//
+// Split out from ReHome so a caller with several references can validate them
+// ALL before performing any copy: a copy that succeeds and is then followed by
+// a rejected sibling reference leaves an unreferenced durable object behind
+// (an orphan the caller cannot clean up). Fails loud on an unknown / malformed
+// / foreign-tenant reference.
+func (s *Service) Check(ctx context.Context, tenantID, raw string) (CheckedReference, error) {
 	ref, err := s.copier.ClassifyReference(ctx, raw)
 	if err != nil {
-		return "", false, fmt.Errorf("mediarehome: %w", err)
+		return CheckedReference{}, fmt.Errorf("mediarehome: %w", err)
 	}
 
 	// OWNERSHIP — applies to EVERY classified object reference, durable ones
-	// included, and therefore runs BEFORE the durable early-return. A trusted
-	// origin + bucket does not prove the object belongs to the tenant being
-	// accepted: the accept path prefers a client-supplied image_url over the
-	// stored draft's, and the read signer scopes on bucket only — so a foreign
-	// DURABLE ref returned verbatim here would be persisted and later signed
-	// and served. Refuse it exactly like a foreign transient source.
+	// included. A trusted origin + bucket does not prove the object belongs to
+	// the tenant being accepted: the accept path prefers a client-supplied
+	// image_url over the stored draft's, and the read signer scopes on bucket
+	// only — so a foreign DURABLE ref returned verbatim would be persisted and
+	// later signed and served. Refuse it exactly like a foreign transient
+	// source.
 	if !referenceBelongsToTenant(tenantID, ref.Key) {
-		return "", false, fmt.Errorf(
+		return CheckedReference{}, fmt.Errorf(
 			"mediarehome: refusing to re-home %q — object is outside tenant %q's namespace %q",
 			ref.Key, tenantID, ports.TenantMediaPrefix(tenantID))
 	}
 
+	return CheckedReference{Raw: raw, Kind: ref.Kind, Bucket: ref.Bucket, Key: ref.Key}, nil
+}
+
+// Copy materialises an already-Checked reference into durable storage under a
+// fresh per-atom key. An already-durable reference is a no-op returning its own
+// ref with changed=false.
+func (s *Service) Copy(ctx context.Context, tenantID, atomID string, ref CheckedReference) (string, bool, error) {
 	if ref.Kind == ports.MediaReferenceDurable {
-		return raw, false, nil
+		return ref.Raw, false, nil
 	}
 
 	durableURI, err := s.copier.CopyToDurable(ctx, ports.CopyToDurableParams{
