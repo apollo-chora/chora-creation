@@ -1,24 +1,29 @@
-// accept_media_ownership_test.go — the P1 scenario at the real accept seam.
+// accept_media_ownership_test.go — the ownership boundary at the real accept
+// seam.
 //
 // The accept handler PREFERS a client-supplied image_url over the stored
 // draft's (question_jobs_handler.go: `if ac.ImageURL != nil { ... }`), so a
-// caller can name ANY object in the transient bucket. The copy then runs with
-// chora-creation's own S3 credentials. A trusted origin + bucket does not prove
-// ownership, so both the re-home service and the adapter refuse a source key
-// outside the accepting tenant's namespace.
+// caller can name ANY object in the transient OR durable bucket. The copy then
+// runs with chora-creation's own S3 credentials, and the read signer scopes on
+// bucket only — so a foreign ref that reached persistence would later be signed
+// and served.
 //
-// These tests wire the REAL S3 adapter behind the real accept route: a
-// foreign-tenant source must fail loud with NO copy attempted, and the tenant's
-// own object must still re-home.
+// These tests wire the REAL S3 adapter behind the real accept route and assert
+// three things for a refusal: fail-loud 500, NO S3 copy request, and NO
+// persisted question (so no revision can carry the supplied ref).
 package httpadapter_test
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	mediastore "github.com/apollo-chora/chora-creation/internal/adapter/mediastore"
+	"github.com/apollo-chora/chora-creation/internal/domain/question"
+	"github.com/apollo-chora/chora-creation/internal/ports"
 )
 
 // newCountingS3Endpoint returns a stub S3 endpoint that answers every copy with
@@ -52,6 +57,32 @@ func newRealReHomer(t *testing.T, s3Endpoint string) *mediastore.AtomMediaSigner
 	return signer
 }
 
+// assertNoQuestionPersisted asserts a refused accept left no question row on the
+// target atom, so no revision can carry the client-supplied ref. The route atom
+// itself may have been re-saved before the re-home call — that is the handler's
+// pre-existing ordering, deliberately unchanged here.
+func assertNoQuestionPersisted(t *testing.T, qRepo ports.QuestionRepository, atomID string) {
+	t.Helper()
+	q, rev, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if !errors.Is(err, question.ErrNotFound) {
+		t.Fatalf("GetByAtomID(%s) err = %v (q=%v rev=%v); want ErrNotFound — a refused accept must persist no question",
+			atomID, err, q, rev)
+	}
+}
+
+func assertAcceptRefused(t *testing.T, code int, body string, requests int) {
+	t.Helper()
+	if code != http.StatusInternalServerError {
+		t.Fatalf("accept status=%d; want 500; body=%s", code, body)
+	}
+	if !strings.Contains(body, "CREATION_ATOM_MEDIA_REHOME_FAILED") {
+		t.Errorf("body %s should carry CREATION_ATOM_MEDIA_REHOME_FAILED", body)
+	}
+	if requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0 (no cross-tenant copy)", requests)
+	}
+}
+
 func TestAcceptQuestionJob_ForeignTenantImageRefused_NoCopy(t *testing.T) {
 	srv, requests := newCountingS3Endpoint(t)
 	reHomer := newRealReHomer(t, srv.URL)
@@ -60,16 +91,24 @@ func TestAcceptQuestionJob_ForeignTenantImageRefused_NoCopy(t *testing.T) {
 	// bucket — a well-formed, correctly-origined, correctly-bucketed ref.
 	foreign := "https://storage.googleapis.com/" + reHomeTransientBucket +
 		"/tenants/someone-else/jobs/j1/secret.png?X-Goog-Expires=604800"
-	w, _, _ := acceptCandWithRehome(t, reHomer, mcqCandidate("d1", foreign, ""))
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("accept with a foreign-tenant image status=%d; want 500; body=%s", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "CREATION_ATOM_MEDIA_REHOME_FAILED") {
-		t.Errorf("body %s should carry CREATION_ATOM_MEDIA_REHOME_FAILED", w.Body.String())
-	}
-	if *requests != 0 {
-		t.Errorf("S3 endpoint received %d requests; want 0 (no cross-tenant copy)", *requests)
-	}
+	w, qRepo, atomID := acceptCandWithRehome(t, reHomer, mcqCandidate("d1", foreign, ""))
+	assertAcceptRefused(t, w.Code, w.Body.String(), *requests)
+	assertNoQuestionPersisted(t, qRepo, atomID)
+}
+
+// The DURABLE bypass at the real accept seam. ClassifyReference calls this ref
+// Durable — it is well-formed and names the configured durable bucket — so
+// before the ownership check covered durable refs, ReHome returned it verbatim
+// and the foreign ref would have been persisted, then signed and served by the
+// read path.
+func TestAcceptQuestionJob_ForeignTenantDurableRefRefused(t *testing.T) {
+	srv, requests := newCountingS3Endpoint(t)
+	reHomer := newRealReHomer(t, srv.URL)
+
+	foreign := "s3://" + reHomeDurableBucket + "/tenants/someone-else/atoms/a1/secret.png"
+	w, qRepo, atomID := acceptCandWithRehome(t, reHomer, mcqCandidate("d1", foreign, ""))
+	assertAcceptRefused(t, w.Code, w.Body.String(), *requests)
+	assertNoQuestionPersisted(t, qRepo, atomID)
 }
 
 func TestAcceptQuestionJob_OwnTenantImageStillReHomes(t *testing.T) {
@@ -88,5 +127,25 @@ func TestAcceptQuestionJob_OwnTenantImageStillReHomes(t *testing.T) {
 	mcq := latestMCQ(t, qRepo, atomID)
 	if mcq.ImageURL == nil || !strings.HasPrefix(*mcq.ImageURL, "s3://"+reHomeDurableBucket+"/") {
 		t.Errorf("ImageURL = %v; want a durable s3:// ref", deref(mcq.ImageURL))
+	}
+}
+
+// A same-tenant DURABLE ref is accepted verbatim (idempotent, no copy) — the
+// ownership check must not break the already-durable fast path.
+func TestAcceptQuestionJob_OwnTenantDurableRefAcceptedUnchanged(t *testing.T) {
+	srv, requests := newCountingS3Endpoint(t)
+	reHomer := newRealReHomer(t, srv.URL)
+
+	own := "s3://" + reHomeDurableBucket + "/tenants/" + tenantA + "/atoms/a1/obj.png"
+	w, qRepo, atomID := acceptCandWithRehome(t, reHomer, mcqCandidate("d1", own, ""))
+	if w.Code != http.StatusOK {
+		t.Fatalf("accept with the tenant's own durable ref status=%d; want 200; body=%s", w.Code, w.Body.String())
+	}
+	if *requests != 0 {
+		t.Errorf("S3 endpoint received %d requests; want 0 (already durable — no copy)", *requests)
+	}
+	mcq := latestMCQ(t, qRepo, atomID)
+	if mcq.ImageURL == nil || *mcq.ImageURL != own {
+		t.Errorf("ImageURL = %v; want the unchanged durable ref %q", deref(mcq.ImageURL), own)
 	}
 }

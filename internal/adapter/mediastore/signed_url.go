@@ -268,11 +268,11 @@ func (s *AtomMediaSigner) Sign(ctx context.Context, atomID, tenantID string, in 
 // collision on re-mint; ext lets a downstream consumer probe MIME
 // without re-introspection.
 //
-// The per-tenant prefix comes from ports.TransientTenantPrefix — the single
+// The per-tenant prefix comes from ports.TenantMediaPrefix — the single
 // definition of the ownership boundary, shared with the transient keys qgen
 // writes (`tenants/{tenant}/jobs/{job}/{file}`) that a re-home sources from.
 func AtomMediaKey(tenantID, atomID, objectID, ext string) string {
-	return ports.TransientTenantPrefix(tenantID) + "atoms/" + atomID + "/" + objectID + "." + ext
+	return ports.TenantMediaPrefix(tenantID) + "atoms/" + atomID + "/" + objectID + "." + ext
 }
 
 // AtomMediaURI joins bucket + key into a canonical s3:// URI.

@@ -16,7 +16,7 @@ package ports
 
 import "context"
 
-// TransientTenantPrefix returns the per-tenant namespace prefix that every
+// TenantMediaPrefix returns the per-tenant namespace prefix that every
 // atom-media object key lives under — `tenants/{tenant_id}/`.
 //
 // It is the OWNERSHIP boundary for a re-home. Two writers put objects under
@@ -27,14 +27,22 @@ import "context"
 // Because the copy runs with the ADAPTER's own credentials, a trusted host and
 // bucket do not prove the object belongs to the caller — a client-supplied
 // image_url can name any object in the transient bucket — so both the service
-// and the adapter refuse a source key outside the caller's own prefix.
+// and the adapter refuse a reference outside the caller's own prefix. The
+// service applies this to EVERY classified reference, durable ones included:
+// an already-durable foreign ref must not be accepted verbatim either, since
+// the read signer scopes on bucket only and would later serve it.
+//
+// POLICY — the boundary is TENANT-level, deliberately. A same-tenant key under
+// ANY job or atom is accepted, because job-level (or author-level) scoping
+// would additionally require proving the caller authored the originating job,
+// and that is a product authorization question (are transient generated images
+// private to the job/author that produced them?) rather than something this
+// namespace can answer. Tightening it later means narrowing this helper, and
+// the callers need no change.
 //
 // The trailing slash is part of the prefix: `tenants/abc/` must never match
 // `tenants/abcd/`.
-//
-// Only the TENANT is namespaced, not the job: a same-tenant key under any job
-// is a legitimate re-home source.
-func TransientTenantPrefix(tenantID string) string {
+func TenantMediaPrefix(tenantID string) string {
 	return "tenants/" + tenantID + "/"
 }
 
@@ -46,7 +54,7 @@ func TransientTenantPrefix(tenantID string) string {
 type CopyToDurableParams struct {
 	// SrcBucket / SrcKey locate the source object in the transient bucket
 	// (supplied by the re-home service from ClassifyReference). SrcKey MUST
-	// sit under TransientTenantPrefix(TenantID): the adapter refuses to copy a
+	// sit under TenantMediaPrefix(TenantID): the adapter refuses to copy a
 	// source object belonging to another tenant.
 	SrcBucket string
 	SrcKey    string

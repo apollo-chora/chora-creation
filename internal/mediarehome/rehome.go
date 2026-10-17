@@ -35,12 +35,13 @@ func New(copier ports.MediaReHomer) *Service { return &Service{copier: copier} }
 //   - empty input              → ("", false, nil)  (no image)
 //   - already-durable ref       → (ref, false, nil) (idempotent — no copy)
 //   - transient ref             → (durable ref, true, nil) after copy
-//   - foreign-tenant source     → ("", false, error) (fail-loud — no copy)
+//   - foreign-tenant reference  → ("", false, error) (fail-loud — no copy)
 //   - unclassifiable ref        → ("", false, error) (fail-loud)
 //
-// tenantID + atomID scope the destination key. A publish that re-homes the
-// same atom twice is a no-op the second time (the stored ref is already
-// durable), so re-publish is safe.
+// The ownership check covers DURABLE references too, not just copyable
+// transient ones — see referenceBelongsToTenant. tenantID + atomID scope the
+// destination key. A publish that re-homes the same atom twice is a no-op the
+// second time (the stored ref is already durable), so re-publish is safe.
 func (s *Service) ReHome(ctx context.Context, tenantID, atomID, imageURL string) (string, bool, error) {
 	raw := strings.TrimSpace(imageURL)
 	if raw == "" {
@@ -55,19 +56,22 @@ func (s *Service) ReHome(ctx context.Context, tenantID, atomID, imageURL string)
 	if err != nil {
 		return "", false, fmt.Errorf("mediarehome: %w", err)
 	}
-	if ref.Kind == ports.MediaReferenceDurable {
-		return raw, false, nil
-	}
 
-	// OWNERSHIP (defense in depth — the adapter checks this too). A trusted
+	// OWNERSHIP — applies to EVERY classified object reference, durable ones
+	// included, and therefore runs BEFORE the durable early-return. A trusted
 	// origin + bucket does not prove the object belongs to the tenant being
 	// accepted: the accept path prefers a client-supplied image_url over the
-	// stored draft's, and the copy runs with the adapter's own credentials.
-	// Refuse a foreign-tenant source before asking for the copy.
-	if !sourceBelongsToTenant(tenantID, ref.Key) {
+	// stored draft's, and the read signer scopes on bucket only — so a foreign
+	// DURABLE ref returned verbatim here would be persisted and later signed
+	// and served. Refuse it exactly like a foreign transient source.
+	if !referenceBelongsToTenant(tenantID, ref.Key) {
 		return "", false, fmt.Errorf(
-			"mediarehome: refusing to re-home %q — source object is outside tenant %q's namespace %q",
-			ref.Key, tenantID, ports.TransientTenantPrefix(tenantID))
+			"mediarehome: refusing to re-home %q — object is outside tenant %q's namespace %q",
+			ref.Key, tenantID, ports.TenantMediaPrefix(tenantID))
+	}
+
+	if ref.Kind == ports.MediaReferenceDurable {
+		return raw, false, nil
 	}
 
 	durableURI, err := s.copier.CopyToDurable(ctx, ports.CopyToDurableParams{
@@ -83,15 +87,17 @@ func (s *Service) ReHome(ctx context.Context, tenantID, atomID, imageURL string)
 	return durableURI, true, nil
 }
 
-// sourceBelongsToTenant reports whether a classified transient source key sits
-// under the caller's own per-tenant namespace (ports.TransientTenantPrefix).
+// referenceBelongsToTenant reports whether a classified reference's key sits
+// under the caller's own per-tenant namespace (ports.TenantMediaPrefix).
 //
-// Only the TENANT is namespaced, not the job: a same-tenant key under any job
-// is a legitimate re-home source, so this deliberately does not narrow to
-// `jobs/{job_id}/`. ref.Key comes from ClassifyReference, which strips the
-// presign query, so it is safe to name in the error.
-func sourceBelongsToTenant(tenantID, key string) bool {
-	return strings.HasPrefix(key, ports.TransientTenantPrefix(tenantID))
+// The boundary is TENANT-level, deliberately — see the policy note on
+// ports.TenantMediaPrefix. A same-tenant key under any job or atom is accepted;
+// narrowing to the originating job would need the caller's authorship of that
+// job, which this namespace cannot answer. ref.Key comes from
+// ClassifyReference, which strips the presign query, so it is safe to name in
+// the error.
+func referenceBelongsToTenant(tenantID, key string) bool {
+	return strings.HasPrefix(key, ports.TenantMediaPrefix(tenantID))
 }
 
 // extOf returns the lowercased file extension of an object key, defaulting

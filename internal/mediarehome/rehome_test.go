@@ -359,6 +359,67 @@ func TestReHome_TenantPrefixBoundary_NoCopy(t *testing.T) {
 	}
 }
 
+// BLOCKER REGRESSION — the ownership guard must cover DURABLE references too.
+// A foreign-tenant ref in the configured durable bucket classifies as Durable
+// (well-formed, right bucket), so an early return before the check would
+// persist it verbatim; the read signer scopes on bucket only and would then
+// sign and serve another tenant's object. It must be refused exactly like a
+// foreign transient source.
+func TestReHome_ForeignTenantDurableRef_Rejected(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []ports.MediaReferenceKind{
+		ports.MediaReferenceDurable,
+		ports.MediaReferenceTransient,
+	} {
+		f := &fakeCopier{classifyRet: &ports.MediaReference{
+			Kind:   kind,
+			Bucket: durableBucket,
+			Key:    "tenants/someone-else/atoms/a1/secret.png",
+		}}
+		svc := mediarehome.New(f)
+
+		got, changed, err := svc.ReHome(context.Background(), "t1", "a1",
+			"s3://"+durableBucket+"/tenants/someone-else/atoms/a1/secret.png")
+		if err == nil {
+			t.Fatalf("kind=%v: ReHome(foreign-tenant ref) should error; got (%q,%v,nil)", kind, got, changed)
+		}
+		if got != "" || changed {
+			t.Errorf("kind=%v: ReHome(foreign-tenant ref) = (%q,%v); want (\"\",false)", kind, got, changed)
+		}
+		if f.called != 0 {
+			t.Errorf("kind=%v: copier called %d times; want 0", kind, f.called)
+		}
+		if !strings.Contains(err.Error(), "t1") || !strings.Contains(err.Error(), "someone-else") {
+			t.Errorf("kind=%v: error %q should name the tenant and the offending key", kind, err.Error())
+		}
+	}
+}
+
+// A same-tenant DURABLE ref is still returned unchanged with changed=false and
+// no copy — the ownership check must not break idempotency.
+func TestReHome_SameTenantDurableRef_Idempotent(t *testing.T) {
+	t.Parallel()
+	for _, scheme := range []string{"s3://", "gs://"} {
+		f := &fakeCopier{}
+		svc := mediarehome.New(f)
+		ref := scheme + durableBucket + "/tenants/t1/atoms/a1/obj.png"
+
+		got, changed, err := svc.ReHome(context.Background(), "t1", "a1", ref)
+		if err != nil {
+			t.Fatalf("ReHome(%q) err = %v; want nil", ref, err)
+		}
+		if changed {
+			t.Errorf("ReHome(%q) changed=true; want false (idempotent)", ref)
+		}
+		if got != ref {
+			t.Errorf("ReHome(%q) = %q; want unchanged", ref, got)
+		}
+		if f.called != 0 {
+			t.Errorf("ReHome(%q) called the copier %d times; want 0", ref, f.called)
+		}
+	}
+}
+
 // Only the TENANT is namespaced, not the job: a same-tenant key under any job
 // (or none) is a legitimate re-home source, so the guard must not
 // over-restrict.

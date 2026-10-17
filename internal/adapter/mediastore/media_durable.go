@@ -260,8 +260,9 @@ func (s *AtomMediaSigner) CopyToDurable(ctx context.Context, p ports.CopyToDurab
 	// accept path the handler prefers a client-supplied image_url over the
 	// stored draft's, so SrcKey is attacker-influenced. Refuse anything outside
 	// the caller's own tenant namespace BEFORE minting a destination key or
-	// touching the network.
-	tenantPrefix := ports.TransientTenantPrefix(p.TenantID)
+	// touching the network. (The service checks the same boundary for every
+	// classified reference; this is independent protection for the copy itself.)
+	tenantPrefix := ports.TenantMediaPrefix(p.TenantID)
 	if !strings.HasPrefix(p.SrcKey, tenantPrefix) {
 		return "", fmt.Errorf(
 			"atom-media: refusing to copy source key %s — it is outside tenant %q's namespace %q",
