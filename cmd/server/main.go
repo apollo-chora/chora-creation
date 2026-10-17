@@ -824,8 +824,15 @@ func main() {
 	// CREATION_ATOM_MEDIA_NOT_WIRED. NO stub fallback.
 	//
 	// The adapter presigns PUT/GET URLs against S3-compatible storage
-	// (MinIO / S3) using static credentials from the environment
+	// (MinIO / Garage / S3) using static credentials from the environment
 	// (S3_ENDPOINT / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY).
+	//
+	// Re-homing a generated image additionally needs ATOM_MEDIA_TRANSIENT_BUCKET
+	// (the bucket the copy sources from) and ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN
+	// (the origin that issued the transient presigned URL). The origin is
+	// REQUIRED for http(s) refs: unset, ClassifyReference refuses every one of
+	// them rather than trusting an arbitrary host, and an image accept fails
+	// loud. Boot, text questions and already-durable refs are unaffected.
 	var atomMediaSigner ports.AtomMediaSigner
 	atomMediaBucket := strings.TrimSpace(os.Getenv("ATOM_MEDIA_BUCKET"))
 	if atomMediaBucket == "" {
@@ -965,7 +972,8 @@ func main() {
 		// POST /api/atoms/{id}/media 503s CREATION_ATOM_MEDIA_NOT_WIRED.
 		AtomMediaSigner: atomMediaSigner,
 		// OT#4 — durable W8 image re-home on publish + authoring-read
-		// mint-on-read. Nil ⇒ re-home no-ops + gs:// refs return raw.
+		// mint-on-read. Nil ⇒ re-home no-ops + durable refs are dropped from
+		// the projections (never emitted raw).
 		MediaReHomer:            mediaReHomer,
 		AtomMediaDownloadSigner: mediaDownloadSigner,
 		// WS-6a-wiring — Personal Collections (2026-05-26).
@@ -1121,8 +1129,9 @@ func main() {
 	creationServer := creationgrpc.NewCreationServer(creationgrpc.Deps{
 		Atoms:     atomRepo,
 		Questions: questionRepo,
-		// OT#4 — MintAtomMediaDownloadURL signs durable atom-media gs:// refs
-		// for chora-delivery's learner mint-on-read. Nil ⇒ RPC 503s.
+		// OT#4 — MintAtomMediaDownloadURL signs durable atom-media object refs
+		// (s3:// for the S3 adapter) for chora-delivery's learner mint-on-read.
+		// Nil ⇒ RPC 503s.
 		DownloadSigner: mediaDownloadSigner,
 		// ADR-229 WS-2 (CHO-2133) — SnapshotQuestionByID reuse gate. Nil ⇒
 		// caller_gcid-bearing non-owner snapshots refuse FAILED_PRECONDITION

@@ -50,8 +50,9 @@ type QuestionsHandler struct {
 	// eventing); production ALWAYS wires deps.JobEventPublisher.
 	publisher JobEventPublisher
 	// mediaDownloadSigner mints fresh short-lived signed GET URLs for durable
-	// gs:// atom-media refs on the author re-open projection (CHO-1638). May be
-	// nil in tests / when the signer is not wired — minting is then a no-op.
+	// atom-media refs on the author re-open projection (CHO-1638). May be nil in
+	// tests / when the signer is not wired — a durable ref is then DROPPED from
+	// the projection (logged), never returned raw.
 	mediaDownloadSigner ports.AtomMediaDownloadSigner
 	// savedAtomFetcher fetches the caller bookmarked atom IDs from
 	// chora-sharing for the picker saved disjunct (ux_unified_atom_picker.md).
@@ -72,9 +73,9 @@ type QuestionsHandler struct {
 }
 
 // NewQuestionsHandler constructs the handler over the two repository ports plus
-// the (optional) atom-media download signer used to mint durable gs:// image
-// refs on the author projection and the sharing-backed consent fetchers for
-// the picker's saved + granted disjuncts (ADR-229 WS-2).
+// the (optional) atom-media download signer used to mint durable atom-media
+// image refs on the author projection and the sharing-backed consent fetchers
+// for the picker's saved + granted disjuncts (ADR-229 WS-2).
 func NewQuestionsHandler(repo ports.QuestionRepository, atomRepo atom.Repository, signer ports.AtomMediaDownloadSigner, publisher JobEventPublisher, savedFetcher ports.SavedAtomIDFetcher, reuseFetcher ports.ReuseContextFetcher) *QuestionsHandler {
 	return &QuestionsHandler{repo: repo, atomRepo: atomRepo, mediaDownloadSigner: signer, publisher: publisher, savedAtomFetcher: savedFetcher, reuseContext: reuseFetcher}
 }
@@ -944,8 +945,9 @@ func (h *QuestionsHandler) patchQuestion(w http.ResponseWriter, r *http.Request,
 	// ADR-210 — durably re-home the revision's transient W8 images into
 	// chora-atom-media at save, so a saved-but-unpublished image survives the
 	// 7-day transient bucket TTL (completes CHO-1974). Append-only: on a
-	// rewrite this appends a further revision carrying the durable gs:// refs
-	// (idempotent — an already-durable ref is a no-op). Fail-loud.
+	// rewrite this appends a further revision carrying the durable object refs
+	// (reference-level idempotent — an already-durable ref is a no-op; the
+	// bytes are not deduplicated). Fail-loud.
 	if h.reHomer != nil {
 		rehomed, changed, rerr := h.reHomer.ReHomeRevision(r.Context(), tenantID, atomID, updated, newRev)
 		if rerr != nil {
@@ -1004,10 +1006,10 @@ func (h *QuestionsHandler) getQuestion(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	// CHO-1638 — an <img> can't carry a bearer JWT, and a PUBLISHED atom stores
-	// the canonical durable gs:// ref, so the raw value never renders on the
-	// author re-open. Mint the durable refs to fresh short-lived signed GET URLs
-	// (transient https refs from draft atoms pass through). Never mutate the
-	// repo's struct — mint over a shallow copy.
+	// the canonical durable object ref (s3:// on the S3 adapter), so the raw
+	// value never renders on the author re-open. Mint the durable refs to fresh
+	// short-lived signed GET URLs (transient https refs from draft atoms pass
+	// through). Never mutate the repo's struct — mint over a shallow copy.
 	writeJSON(w, http.StatusOK, questionWithRevisionResponse{Question: h.mintQuestionMedia(r.Context(), q), Revision: rev})
 }
 
@@ -1047,21 +1049,35 @@ func (h *QuestionsHandler) mintMediaRef(ctx context.Context, ref *string) *strin
 	if ref == nil || *ref == "" {
 		return ref
 	}
-	if h.mediaDownloadSigner != nil && h.mediaDownloadSigner.IsDurableRef(*ref) {
-		signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
-		if err != nil {
-			log.Printf("getQuestion: mint atom-media ref=%s: %v (dropping from author projection)", *ref, err)
+	if h.mediaDownloadSigner == nil {
+		// No signer wired: a durable ref cannot be minted, so it is dropped
+		// rather than emitted raw; a transient http(s) ref is already
+		// fetchable. The drop is LOGGED because the request still succeeds —
+		// without it a misconfigured deployment shows a silently missing
+		// illustration on the author re-open.
+		if !isFetchableMediaRef(*ref) {
+			log.Printf("getQuestion: media download signer NOT wired — dropping ref %s from the author projection",
+				redactMediaRef(*ref))
 			return nil
 		}
-		url := signed.URL
-		return &url
-	}
-	if isFetchableMediaRef(*ref) {
 		return ref
 	}
-	// Neither mintable nor fetchable (an unwired signer holding a durable ref, a
-	// foreign bucket, a malformed ref) — never emit it raw.
-	return nil
+	if !h.mediaDownloadSigner.IsDurableRef(*ref) {
+		// Not a durable atom-media object: a transient http(s) ref is already
+		// fetchable; anything else (a foreign bucket, a malformed ref) is
+		// dropped rather than emitted raw.
+		if isFetchableMediaRef(*ref) {
+			return ref
+		}
+		return nil
+	}
+	signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
+	if err != nil {
+		log.Printf("getQuestion: mint atom-media ref=%s: %v (dropping from author projection)", redactMediaRef(*ref), err)
+		return nil
+	}
+	url := signed.URL
+	return &url
 }
 
 // -----------------------------------------------------------------------------
@@ -1229,7 +1245,7 @@ func rubricFromWireCriteria(in []createRubricCriterion) *question.Rubric {
 // image_url/answer_image_url) silently dropped the AI-assist images (CHO-1974).
 func resolvePatchImageRef(wire, prev *string) *string {
 	if wire == nil {
-		return prev // omitted ⇒ keep the prior image (durable gs:// ref)
+		return prev // omitted ⇒ keep the prior image (a durable object ref)
 	}
 	if *wire == "" {
 		return nil // explicit clear (Remove)

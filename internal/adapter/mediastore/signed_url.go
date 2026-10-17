@@ -18,8 +18,9 @@
 // SDK credential chain.
 //
 // Reference classification (ports.MediaReHomer.ClassifyReference) is
-// configured by ATOM_MEDIA_TRANSIENT_BUCKET and the optional
-// ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN — see NewAtomMediaSigner.
+// configured by ATOM_MEDIA_TRANSIENT_BUCKET, plus the
+// ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN that http(s) references REQUIRE — see
+// NewAtomMediaSigner.
 package mediastore
 
 import (
@@ -88,9 +89,10 @@ func WithTransientBucket(bucket string) AtomMediaSignerOption {
 }
 
 // WithTrustedPublicOrigin pins the public origin an http(s) reference must
-// be served from. Defaults to env ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN. Left
-// unset, ClassifyReference accepts any host (the transient-bucket check
-// still applies).
+// be served from. Defaults to env ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN. It is
+// REQUIRED for http(s) references: left unset, ClassifyReference refuses
+// every http(s) ref (fail closed) rather than accepting any host. Durable
+// s3:// / gs:// refs are unaffected.
 func WithTrustedPublicOrigin(origin string) AtomMediaSignerOption {
 	return func(s *AtomMediaSigner) {
 		s.trustedPublicOrigin = strings.TrimSpace(origin)
@@ -131,9 +133,12 @@ type AtomMediaSigner struct {
 //     the durable copy sources from. Unset ⇒ durable s3:// / gs:// refs
 //     still classify, but an http(s) ref fails loud ("transient bucket is
 //     not configured") instead of guessing one.
-//   - ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN — optional. When set, an http(s)
-//     ref whose host differs is rejected. Unset ⇒ any host is accepted and
-//     the transient-bucket check alone authorises the ref.
+//   - ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN — the origin that issues the
+//     transient presigned URLs. REQUIRED for http(s) references: unset ⇒
+//     every http(s) ref fails loud ("trusted public origin is not
+//     configured"), because an unauthenticated host is not a copy source we
+//     can trust. Boot is unaffected; durable refs and text questions keep
+//     working.
 //
 // Both can be overridden per-call via WithTransientBucket /
 // WithTrustedPublicOrigin.

@@ -29,6 +29,9 @@ import (
 const (
 	testDurableBucket   = "chora-atom-media"
 	testTransientBucket = "chora-ai-assist-images"
+	// testTrustedOrigin is the origin that issues the transient presigned
+	// URLs in the Garage/S3 deployment shape.
+	testTrustedOrigin = "http://146.235.20.25:9000"
 )
 
 func newTestSigner(t *testing.T) *mediastore.AtomMediaSigner {
@@ -46,8 +49,8 @@ func newTestSigner(t *testing.T) *mediastore.AtomMediaSigner {
 	return signer
 }
 
-// newTestSignerWithTransient builds a signer whose transient bucket is
-// configured — the Garage/S3 deployment shape.
+// newTestSignerWithTransient builds a signer whose transient bucket AND
+// trusted presign origin are configured — the Garage/S3 deployment shape.
 func newTestSignerWithTransient(t *testing.T) *mediastore.AtomMediaSigner {
 	t.Helper()
 	t.Setenv("S3_ENDPOINT", "http://localhost:9000")
@@ -56,7 +59,25 @@ func newTestSignerWithTransient(t *testing.T) *mediastore.AtomMediaSigner {
 	t.Setenv("ATOM_MEDIA_TRANSIENT_BUCKET", "")
 	t.Setenv("ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN", "")
 	signer, err := mediastore.NewAtomMediaSigner(testDurableBucket,
-		mediastore.WithTransientBucket(testTransientBucket))
+		mediastore.WithTransientBucket(testTransientBucket),
+		mediastore.WithTrustedPublicOrigin(testTrustedOrigin))
+	if err != nil {
+		t.Fatalf("NewAtomMediaSigner: %v", err)
+	}
+	return signer
+}
+
+// newTestSignerWithOrigin builds a signer with the given trusted origin and
+// no transient bucket — for the origin-validation cases.
+func newTestSignerWithOrigin(t *testing.T, origin string) *mediastore.AtomMediaSigner {
+	t.Helper()
+	t.Setenv("S3_ENDPOINT", "http://localhost:9000")
+	t.Setenv("S3_ACCESS_KEY_ID", "test")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
+	t.Setenv("ATOM_MEDIA_TRANSIENT_BUCKET", "")
+	t.Setenv("ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN", "")
+	signer, err := mediastore.NewAtomMediaSigner(testDurableBucket,
+		mediastore.WithTrustedPublicOrigin(origin))
 	if err != nil {
 		t.Fatalf("NewAtomMediaSigner: %v", err)
 	}
@@ -239,9 +260,20 @@ func TestClassifyReference_TransientGarageURL(t *testing.T) {
 }
 
 // A GCS path-style signed URL on the transient bucket classifies Transient
-// too (the same shape, a different host).
+// too — the same shape with its own trusted origin (a scheme with no
+// explicit port, so the comparison is on effective ports).
 func TestClassifyReference_TransientGCSURL(t *testing.T) {
-	signer := newTestSignerWithTransient(t)
+	t.Setenv("S3_ENDPOINT", "http://localhost:9000")
+	t.Setenv("S3_ACCESS_KEY_ID", "test")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
+	t.Setenv("ATOM_MEDIA_TRANSIENT_BUCKET", "")
+	t.Setenv("ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN", "")
+	signer, err := mediastore.NewAtomMediaSigner(testDurableBucket,
+		mediastore.WithTransientBucket(testTransientBucket),
+		mediastore.WithTrustedPublicOrigin("https://storage.googleapis.com"))
+	if err != nil {
+		t.Fatalf("NewAtomMediaSigner: %v", err)
+	}
 
 	ref := "https://storage.googleapis.com/" + testTransientBucket +
 		"/tenants/t1/jobs/j9/abc.png?X-Goog-Expires=604800"
@@ -254,6 +286,12 @@ func TestClassifyReference_TransientGCSURL(t *testing.T) {
 	}
 	if got.Bucket != testTransientBucket || got.Key != "tenants/t1/jobs/j9/abc.png" {
 		t.Errorf("(Bucket,Key) = (%q,%q); want (%q,tenants/t1/jobs/j9/abc.png)", got.Bucket, got.Key, testTransientBucket)
+	}
+
+	// The default port of the trusted scheme matches an explicit one.
+	explicit := "https://storage.googleapis.com:443/" + testTransientBucket + "/tenants/t1/jobs/j9/abc.png?sig=1"
+	if _, err := signer.ClassifyReference(context.Background(), explicit); err != nil {
+		t.Errorf("ClassifyReference(explicit default port) err = %v; want nil", err)
 	}
 }
 
@@ -275,9 +313,9 @@ func TestClassifyReference_HTTPForeignBucket_Errors(t *testing.T) {
 // An http(s) ref cannot be classified when no transient bucket is
 // configured — fail loud, never guess a bucket.
 func TestClassifyReference_HTTPWithoutTransientBucket_Errors(t *testing.T) {
-	signer := newTestSigner(t) // no transient bucket configured
+	signer := newTestSignerWithOrigin(t, testTrustedOrigin) // origin set, no transient bucket
 
-	ref := "http://146.235.20.25:9000/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?X-Amz-Signature=deadbeef"
+	ref := testTrustedOrigin + "/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?X-Amz-Signature=deadbeef"
 	_, err := signer.ClassifyReference(context.Background(), ref)
 	if err == nil {
 		t.Fatal("ClassifyReference(http) without a transient bucket should error; got nil")
@@ -287,33 +325,105 @@ func TestClassifyReference_HTTPWithoutTransientBucket_Errors(t *testing.T) {
 	}
 }
 
-// A configured trusted public origin pins the host an http(s) ref may come
-// from; an unconfigured one accepts any host.
-func TestClassifyReference_TrustedPublicOrigin(t *testing.T) {
-	t.Setenv("S3_ENDPOINT", "http://localhost:9000")
-	t.Setenv("S3_ACCESS_KEY_ID", "test")
-	t.Setenv("S3_SECRET_ACCESS_KEY", "test")
-	t.Setenv("ATOM_MEDIA_TRANSIENT_BUCKET", "")
+// FAIL CLOSED — with no trusted origin configured, NO http(s) ref is
+// accepted. The origin that issued the presigned URL is the only authority
+// for trusting it, so an unset origin must not degrade to "any host".
+func TestClassifyReference_UntrustedOriginUnset_FailsClosed(t *testing.T) {
+	signer := newTestSignerWithTransient(t)
+	// Drop the origin: the same ref that classifies Transient above must now
+	// be refused.
+	signer = newTestSignerWithOrigin(t, "")
 
-	signer, err := mediastore.NewAtomMediaSigner(testDurableBucket,
-		mediastore.WithTransientBucket(testTransientBucket),
-		mediastore.WithTrustedPublicOrigin("http://146.235.20.25:9000"))
-	if err != nil {
-		t.Fatalf("NewAtomMediaSigner: %v", err)
-	}
-
-	ok := "http://146.235.20.25:9000/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?sig=1"
-	if _, err := signer.ClassifyReference(context.Background(), ok); err != nil {
-		t.Errorf("ClassifyReference(trusted host) err = %v; want nil", err)
-	}
-
-	bad := "http://evil.example.com/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?sig=1"
-	_, err = signer.ClassifyReference(context.Background(), bad)
+	ref := testTrustedOrigin + "/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?X-Amz-Signature=deadbeef"
+	_, err := signer.ClassifyReference(context.Background(), ref)
 	if err == nil {
-		t.Fatal("ClassifyReference(untrusted host) should error; got nil")
+		t.Fatal("ClassifyReference(http) with no trusted origin should error; got nil")
 	}
-	if !strings.Contains(err.Error(), "evil.example.com") {
-		t.Errorf("error %q should name the untrusted host", err.Error())
+	if !strings.Contains(err.Error(), "ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN") {
+		t.Errorf("error %q should name ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN", err.Error())
+	}
+
+	// Durable refs and text questions are unaffected by the missing origin.
+	durable := "s3://" + testDurableBucket + "/tenants/t1/atoms/a1/obj.png"
+	if _, err := signer.ClassifyReference(context.Background(), durable); err != nil {
+		t.Errorf("ClassifyReference(%q) err = %v; want nil (durable refs need no origin)", durable, err)
+	}
+}
+
+// A configured trusted public origin pins the ORIGIN — scheme, host and port
+// compared canonically — that an http(s) ref may come from. A different
+// scheme, host or port is refused, including a look-alike host that a
+// suffix/substring check would have waved through.
+func TestClassifyReference_TrustedPublicOrigin(t *testing.T) {
+	signer := newTestSignerWithTransient(t)
+
+	ok := testTrustedOrigin + "/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?sig=1"
+	if _, err := signer.ClassifyReference(context.Background(), ok); err != nil {
+		t.Errorf("ClassifyReference(trusted origin) err = %v; want nil", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		ref  string
+	}{
+		{"different host", "http://evil.example.com/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?sig=1"},
+		{"host that ends with the trusted host", "http://evil-146.235.20.25:9000/" + testTransientBucket + "/k.png?sig=1"},
+		{"host with the trusted host as a label", "http://146.235.20.25:9000.evil.com/" + testTransientBucket + "/k.png?sig=1"},
+		{"different scheme", "https://146.235.20.25:9000/" + testTransientBucket + "/k.png?sig=1"},
+		{"different port", "http://146.235.20.25:9001/" + testTransientBucket + "/k.png?sig=1"},
+		{"no port", "http://146.235.20.25/" + testTransientBucket + "/k.png?sig=1"},
+		{"default port substituted", "http://146.235.20.25:80/" + testTransientBucket + "/k.png?sig=1"},
+		{"userinfo", "http://user:secret@146.235.20.25:9000/" + testTransientBucket + "/k.png?sig=1"},
+		{"fragment", testTrustedOrigin + "/" + testTransientBucket + "/k.png?sig=1#frag"},
+		{"no host", "http:///" + testTransientBucket + "/k.png?sig=1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := signer.ClassifyReference(context.Background(), tc.ref)
+			if err == nil {
+				t.Errorf("ClassifyReference(%q) should error; got nil", tc.ref)
+			}
+		})
+	}
+}
+
+// A refused reference never puts its presign signature in the error text —
+// these errors are logged by the fail-loud re-home path.
+func TestClassifyReference_ErrorsDoNotLeakTheSignature(t *testing.T) {
+	signer := newTestSignerWithTransient(t)
+
+	for _, ref := range []string{
+		"http://evil.example.com/" + testTransientBucket + "/k.png?X-Amz-Signature=SUPERSECRET",
+		"http://evil.example.com/" + testTransientBucket + "/k.png?X-Amz-Signature=SUPERSECRET#frag",
+		"http://user:pw@evil.example.com/" + testTransientBucket + "/k.png?X-Amz-Signature=SUPERSECRET",
+		"http://evil.example.com/" + testTransientBucket + "?X-Amz-Signature=SUPERSECRET",
+	} {
+		_, err := signer.ClassifyReference(context.Background(), ref)
+		if err == nil {
+			t.Fatalf("ClassifyReference(%q) should error; got nil", ref)
+		}
+		if strings.Contains(err.Error(), "SUPERSECRET") || strings.Contains(err.Error(), "pw@") {
+			t.Errorf("error %q must not carry the presign signature or credentials", err.Error())
+		}
+	}
+}
+
+// The trusted origin may also be configured as a bare `host[:port]`; the
+// authority is compared canonically and the ref must not name another port.
+func TestClassifyReference_BareHostOrigin(t *testing.T) {
+	signer := newTestSignerWithOrigin(t, "146.235.20.25:9000") // no transient bucket
+
+	// The authority matches, so the refusal that follows is the unconfigured
+	// transient bucket — proving the origin check passed.
+	ok := testTrustedOrigin + "/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?sig=1"
+	if _, err := signer.ClassifyReference(context.Background(), ok); err == nil ||
+		!strings.Contains(err.Error(), "transient bucket is not configured") {
+		t.Errorf("bare-host origin should match; got err = %v", err)
+	}
+
+	bad := "http://146.235.20.25:9001/" + testTransientBucket + "/tenants/t1/jobs/j9/x.png?sig=1"
+	if _, err := signer.ClassifyReference(context.Background(), bad); err == nil ||
+		!strings.Contains(err.Error(), "untrusted origin") {
+		t.Errorf("a different port should be refused as an untrusted origin; got err = %v", err)
 	}
 }
 

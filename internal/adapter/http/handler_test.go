@@ -893,6 +893,61 @@ func TestGetAtom_TransientImagePassesThrough(t *testing.T) {
 	}
 }
 
+// A LEGACY gs:// durable ref (written by an earlier GCS-era deployment) is not
+// a scheme the S3 adapter can sign, so the learner projection DROPS it: the
+// illustration disappears rather than being emitted raw. The stored reference is
+// untouched — recovering those images needs a data migration, not a grammar
+// change here.
+func TestGetAtom_LegacyGSRefDropped(t *testing.T) {
+	t.Parallel()
+	called := false
+	signer := fakeDownloadSigner{fn: func(_ context.Context, gsURI string) (ports.SignedDownloadURL, error) {
+		called = true
+		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
+	}}
+	srv, atomID := seedMCQAtomWithSigner(t, signer)
+	legacy := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
+	body := map[string]any{
+		"type":   "mcq",
+		"prompt": "p",
+		"mcq_payload": map[string]any{
+			"options": []map[string]any{
+				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
+				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
+			},
+		},
+		"image_url": legacy,
+	}
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("seed q: %d %s", w.Code, w.Body.String())
+	}
+	w2 := httptest.NewRecorder()
+	srv.ServeHTTP(w2, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("GET atom: %d %s", w2.Code, w2.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(w2.Body.Bytes(), &got); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	qp, ok := got["question_payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected question_payload; got %s", w2.Body.String())
+	}
+	img, _ := qp["image_url"].(string)
+	if img == legacy {
+		t.Errorf("raw legacy gs:// ref emitted to the wire: %q", img)
+	}
+	if img != "" {
+		t.Errorf("legacy gs:// ref must be dropped from the learner projection, got %q", img)
+	}
+	if called {
+		t.Errorf("signer must NOT be asked to sign a scheme it cannot mint")
+	}
+}
+
 // TestGetAtom_QuestionPayload_OE_LearnerSafe — OE projection surfaces
 // type=oe, question_id, prompt, max_score, AND a learner-safe rubric
 // (criteria + weights — but never model_answer). Per the user spec the

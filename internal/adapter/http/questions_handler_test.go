@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -904,6 +905,36 @@ func (f fakeDownloadSigner) IsDurableRef(ref string) bool {
 	return ok && bucket == "chora-atom-media-dev" && key != ""
 }
 
+// syncLogBuffer is a race-safe io.Writer for capturing the standard logger
+// while sibling tests log concurrently.
+type syncLogBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncLogBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncLogBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// captureLog redirects the standard logger into a buffer for the duration of
+// the test and returns a func reporting everything written so far.
+func captureLog(t *testing.T) func() string {
+	t.Helper()
+	prev := log.Writer()
+	buf := &syncLogBuffer{}
+	log.SetOutput(buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return buf.String
+}
+
 // seedMCQAtom seeds an MCQ atom and returns a router wired with the given
 // (optionally nil) download signer plus the atom id.
 func seedMCQAtomWithSigner(t *testing.T, signer ports.AtomMediaDownloadSigner) (http.Handler, string) {
@@ -1116,9 +1147,63 @@ func TestGetQuestionByID_ForeignBucketRefDropped(t *testing.T) {
 	}
 }
 
-// With the signer unwired a durable ref is dropped, never emitted raw.
-func TestGetQuestionByID_UnwiredSignerDropsDurableRef(t *testing.T) {
+// A LEGACY gs:// durable ref (written by an earlier GCS-era deployment) is not
+// a scheme this adapter can sign, so the author projection DROPS it: the image
+// disappears from the response rather than being emitted raw. The stored
+// reference is untouched — recovering those images needs a data migration.
+func TestGetQuestionByID_LegacyGSRefDropped(t *testing.T) {
 	t.Parallel()
+	called := false
+	signer := fakeDownloadSigner{fn: func(_ context.Context, gsURI string) (ports.SignedDownloadURL, error) {
+		called = true
+		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
+	}}
+	srv, atomID := seedMCQAtomWithSigner(t, signer)
+	legacy := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
+	body := map[string]any{
+		"type":   "mcq",
+		"prompt": "p",
+		"mcq_payload": map[string]any{
+			"options": []map[string]any{
+				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
+				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
+			},
+		},
+		"image_url": legacy,
+	}
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	var created map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	qID := created["question"].(map[string]any)["question_id"].(string)
+	w2 := httptest.NewRecorder()
+	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+qID, nil))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("get: %d %s", w2.Code, w2.Body.String())
+	}
+	var fetched map[string]any
+	_ = json.Unmarshal(w2.Body.Bytes(), &fetched)
+	mcq := fetched["question"].(map[string]any)["mcq"].(map[string]any)
+	got, _ := mcq["image_url"].(string)
+	if got == legacy {
+		t.Errorf("raw legacy gs:// ref emitted to the wire: %q", got)
+	}
+	if got != "" {
+		t.Errorf("legacy gs:// ref must be dropped from the projection, got %q", got)
+	}
+	if called {
+		t.Errorf("signer must NOT be asked to sign a scheme it cannot mint")
+	}
+}
+
+// With the signer unwired a durable ref is dropped, never emitted raw — and the
+// drop is LOGGED so a misconfigured deployment (a successful response with a
+// silently missing illustration) is diagnosable.
+func TestGetQuestionByID_UnwiredSignerDropsDurableRef(t *testing.T) {
+	gotLog := captureLog(t)
 	srv, atomID := seedMCQAtomWithSigner(t, nil)
 	body := map[string]any{
 		"type":   "mcq",
@@ -1149,6 +1234,16 @@ func TestGetQuestionByID_UnwiredSignerDropsDurableRef(t *testing.T) {
 	mcq := fetched["question"].(map[string]any)["mcq"].(map[string]any)
 	if s, _ := mcq["image_url"].(string); s != "" {
 		t.Errorf("durable ref with an unwired signer must be dropped, got %q", s)
+	}
+
+	// Diagnosability: the drop is logged, names the missing wiring, and does
+	// not carry the stored ref's path beyond what is needed to identify it.
+	logged := gotLog()
+	if !strings.Contains(logged, "media download signer NOT wired") {
+		t.Errorf("expected a 'signer NOT wired' log line; got:\n%s", logged)
+	}
+	if !strings.Contains(logged, "chora-atom-media-dev") {
+		t.Errorf("log should identify the dropped ref's bucket; got:\n%s", logged)
 	}
 }
 

@@ -50,16 +50,19 @@ func (s *AtomMediaSigner) DurableBucket() string { return s.bucket }
 //   - gs://<bucket>/<key>          → Durable when bucket is the durable
 //     bucket; a foreign bucket is an error (kept so a GCS deployment still
 //     classifies its durable refs).
-//   - http(s)://<host>/<bucket>/<key> → Transient when bucket is the
-//     configured TRANSIENT bucket (env ATOM_MEDIA_TRANSIENT_BUCKET);
-//     anything else is an error. The query string (the presign signature)
-//     is stripped; an empty bucket or key is an error.
+//   - http(s)://<host>/<bucket>/<key> → Transient when host matches the
+//     configured TRUSTED PUBLIC ORIGIN (env
+//     ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN) and bucket is the configured
+//     TRANSIENT bucket (env ATOM_MEDIA_TRANSIENT_BUCKET); anything else is
+//     an error. The query string (the presign signature) is stripped; an
+//     empty bucket or key is an error.
 //   - anything else                → error.
 //
-// When ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN is set an http(s) ref from any
-// other host is rejected; unset, any host is accepted (the transient-bucket
-// check still authorises the ref). The durable bucket is always authorised
-// for s3:// / gs://, whether or not the transient bucket is configured.
+// The http(s) path FAILS CLOSED: with ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN unset
+// no http(s) reference is accepted at all (the error names the env var),
+// because the origin that issued the presigned URL is the only authority for
+// trusting it. Durable refs are unaffected — s3:// / gs:// on the durable
+// bucket classify whether or not either env var is set.
 func (s *AtomMediaSigner) ClassifyReference(_ context.Context, raw string) (ports.MediaReference, error) {
 	ref := strings.TrimSpace(raw)
 	if ref == "" {
@@ -98,17 +101,50 @@ func (s *AtomMediaSigner) ClassifyReference(_ context.Context, raw string) (port
 }
 
 // classifyHTTPReference parses a path-style http(s) object URL
-// (`http(s)://<host>/<bucket>/<key>?<signature>`) — the shape both the GCS
-// V4 path-style URL and the S3/Garage presigned URL take — and authorises
-// it against the configured transient bucket + trusted origin.
+// (`http(s)://<host>/<bucket>/<key>?<signature>`) — the shape both a GCS V4
+// path-style URL and an S3/Garage presigned URL take — and authorises it
+// against the configured trusted origin + transient bucket.
+//
+// It FAILS CLOSED on the origin. The origin that issued the presigned URL is
+// the only authority for accepting an http(s) reference, so when
+// ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN is unset every http(s) reference is
+// refused with an error naming that env var. The service still boots and text
+// questions plus already-durable s3:// refs are unaffected — only a transient
+// http(s) ref needs the origin. A URL that names a different scheme, host or
+// port than the configured origin is refused; the comparison is on parsed
+// components, never a suffix match. Userinfo, a fragment and a missing host
+// are refused outright.
 func (s *AtomMediaSigner) classifyHTTPReference(ref string) (ports.MediaReference, error) {
 	u, err := url.Parse(ref)
 	if err != nil {
-		return ports.MediaReference{}, fmt.Errorf("atom-media: parse media URL: %w", err)
+		return ports.MediaReference{}, fmt.Errorf("atom-media: parse media URL %s: %w", redactedRef(ref), err)
 	}
-	if s.trustedPublicOrigin != "" && !s.hostIsTrusted(u.Host) {
+	if u.Scheme != "http" && u.Scheme != "https" {
 		return ports.MediaReference{}, fmt.Errorf(
-			"atom-media: refusing media URL from untrusted host %q (trusted origin is %q)", u.Host, s.trustedPublicOrigin)
+			"atom-media: unsupported media URL scheme %q (want http or https)", u.Scheme)
+	}
+	if u.User != nil {
+		return ports.MediaReference{}, fmt.Errorf(
+			"atom-media: refusing media URL carrying userinfo: %s", redactedRef(ref))
+	}
+	if u.Fragment != "" || u.RawFragment != "" {
+		return ports.MediaReference{}, fmt.Errorf(
+			"atom-media: refusing media URL carrying a fragment: %s", redactedRef(ref))
+	}
+	if u.Host == "" {
+		return ports.MediaReference{}, fmt.Errorf(
+			"atom-media: media URL has no host: %s", redactedRef(ref))
+	}
+
+	if s.trustedPublicOrigin == "" {
+		return ports.MediaReference{}, errors.New(
+			"atom-media: cannot classify an http(s) media reference: trusted public origin is not configured " +
+				"(set ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN to the origin that issues the presigned URLs)")
+	}
+	if !originMatches(s.trustedPublicOrigin, u) {
+		return ports.MediaReference{}, fmt.Errorf(
+			"atom-media: refusing media URL from untrusted origin %s (trusted origin is %q)",
+			redactedOrigin(u), s.trustedPublicOrigin)
 	}
 
 	// u.Path excludes the query string, so the presign signature is gone.
@@ -116,13 +152,14 @@ func (s *AtomMediaSigner) classifyHTTPReference(ref string) (ports.MediaReferenc
 	i := strings.IndexByte(path, '/')
 	if i <= 0 || i >= len(path)-1 {
 		return ports.MediaReference{}, fmt.Errorf(
-			"atom-media: malformed path-style media URL (want http(s)://<host>/<bucket>/<key>): %q", ref)
+			"atom-media: malformed path-style media URL (want http(s)://<host>/<bucket>/<key>): %s", redactedRef(ref))
 	}
 	bucket, key := path[:i], path[i+1:]
 
 	if s.transientBucket == "" {
-		return ports.MediaReference{}, fmt.Errorf(
-			"atom-media: cannot classify http(s) reference %q: transient bucket is not configured (set ATOM_MEDIA_TRANSIENT_BUCKET)", ref)
+		return ports.MediaReference{}, errors.New(
+			"atom-media: cannot classify an http(s) media reference: transient bucket is not configured " +
+				"(set ATOM_MEDIA_TRANSIENT_BUCKET)")
 	}
 	if bucket != s.transientBucket {
 		return ports.MediaReference{}, fmt.Errorf(
@@ -131,15 +168,79 @@ func (s *AtomMediaSigner) classifyHTTPReference(ref string) (ports.MediaReferenc
 	return ports.MediaReference{Kind: ports.MediaReferenceTransient, Bucket: bucket, Key: key}, nil
 }
 
-// hostIsTrusted reports whether host matches the configured trusted public
-// origin, which may be written either as a bare host[:port] or as a full
-// URL.
-func (s *AtomMediaSigner) hostIsTrusted(host string) bool {
-	want := s.trustedPublicOrigin
-	if u, err := url.Parse(want); err == nil && u.Host != "" {
-		want = u.Host
+// originMatches reports whether u matches the configured trusted origin on
+// scheme, host and port — a canonical comparison of parsed components, never
+// a suffix/substring match. The origin may be configured as a full URL
+// (`http://host:9000`, the preferred form) or as a bare `host[:port]`.
+func originMatches(trusted string, u *url.URL) bool {
+	scheme, host, port, ok := parseTrustedOrigin(trusted)
+	if !ok {
+		return false
 	}
-	return strings.EqualFold(host, want)
+	if scheme != "" && !strings.EqualFold(scheme, u.Scheme) {
+		return false
+	}
+	if !strings.EqualFold(host, u.Hostname()) {
+		return false
+	}
+	switch {
+	case port != "":
+		return u.Port() == port
+	case scheme != "":
+		// The origin pinned a scheme but no port — compare effective ports.
+		return effectivePort(u.Scheme) == effectivePort(scheme)
+	default:
+		// Bare host with no port: the ref must not name one either.
+		return u.Port() == ""
+	}
+}
+
+// parseTrustedOrigin splits the configured trusted origin into canonical
+// (scheme, host, port). scheme is "" for a bare `host[:port]` origin.
+func parseTrustedOrigin(trusted string) (scheme, host, port string, ok bool) {
+	if u, err := url.Parse(trusted); err == nil && u.Host != "" {
+		return strings.ToLower(u.Scheme), strings.ToLower(u.Hostname()), u.Port(), true
+	}
+	if u, err := url.Parse("//" + trusted); err == nil && u.Host != "" {
+		return "", strings.ToLower(u.Hostname()), u.Port(), true
+	}
+	return "", "", "", false
+}
+
+// effectivePort returns a URL's explicit port, or its scheme's default.
+func effectivePort(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+// redactedRef returns ref safe to put in an error or a log line: any
+// userinfo, query string and fragment are stripped, so a presign signature (a
+// credential) never reaches the logs.
+func redactedRef(ref string) string {
+	u, err := url.Parse(ref)
+	if err != nil {
+		return "<unparseable media reference>"
+	}
+	u.User = nil
+	u.RawQuery, u.ForceQuery = "", false
+	u.Fragment, u.RawFragment = "", ""
+	return u.String()
+}
+
+// redactedOrigin renders scheme://host:port for a URL, dropping the path,
+// query and userinfo — the origin alone is what failed the check.
+func redactedOrigin(u *url.URL) string {
+	origin := u.Host
+	if u.Scheme != "" {
+		origin = u.Scheme + "://" + u.Host
+	}
+	return origin
 }
 
 // CopyToDurable performs a server-side S3 copy of
@@ -181,10 +282,19 @@ func (s *AtomMediaSigner) CopyToDurable(ctx context.Context, p ports.CopyToDurab
 // sign — `s3://` only, because parseS3URI accepts nothing else. Reporting a
 // `gs://` durable ref as durable here would hand the signer a ref it always
 // refuses, and a caller could no longer tell "this deployment cannot mint
-// that" from "this needs no minting". A `gs://` ref is therefore NOT durable
-// for this adapter, and the read paths drop any non-durable ref that is not
-// an already-fetchable http(s) URL rather than emitting it raw — so a
-// deployment still holding a gs:// ref loses nothing.
+// that" from "this needs no minting".
+//
+// MIGRATION: a legacy `gs://` ref written by an earlier GCS-era deployment is
+// therefore NOT durable for this adapter. The read paths fail closed on it —
+// they drop any non-durable ref that is not an already-fetchable http(s) URL,
+// so it is never emitted raw — which means the image DISAPPEARS from the
+// author/learner projection even though the stored reference is untouched.
+// Recovering those images needs a data migration to s3://, not a grammar
+// change here.
+//
+// Note the deliberate asymmetry with ClassifyReference, which DOES accept a
+// `gs://` durable ref (for re-home idempotency): classifying a stored string
+// is not the same as this adapter being able to sign it.
 //
 // False for an http(s) URL, an empty string, a foreign bucket, and a
 // malformed ref. Reuses parseS3URI — one grammar, not two.
