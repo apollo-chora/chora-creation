@@ -16,6 +16,11 @@
 // Credentials come from the environment (S3_ENDPOINT / S3_ACCESS_KEY_ID /
 // S3_SECRET_ACCESS_KEY / S3_REGION / S3_FORCE_PATH_STYLE) — no cloud
 // SDK credential chain.
+//
+// Reference classification (ports.MediaReHomer.ClassifyReference) is
+// configured by ATOM_MEDIA_TRANSIENT_BUCKET, plus the
+// ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN that http(s) references REQUIRE — see
+// NewAtomMediaSigner.
 package mediastore
 
 import (
@@ -72,6 +77,28 @@ func WithSignTimeout(d time.Duration) AtomMediaSignerOption {
 	}
 }
 
+// WithTransientBucket sets the TRANSIENT generated-image bucket the adapter
+// accepts http(s) references for (re-home source). Defaults to env
+// ATOM_MEDIA_TRANSIENT_BUCKET. Left unset, ClassifyReference still resolves
+// s3:// / gs:// durable refs but fails loud on any http(s) ref rather than
+// guessing a bucket.
+func WithTransientBucket(bucket string) AtomMediaSignerOption {
+	return func(s *AtomMediaSigner) {
+		s.transientBucket = strings.TrimSpace(bucket)
+	}
+}
+
+// WithTrustedPublicOrigin pins the public origin an http(s) reference must
+// be served from. Defaults to env ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN. It is
+// REQUIRED for http(s) references: left unset, ClassifyReference refuses
+// every http(s) ref (fail closed) rather than accepting any host. Durable
+// s3:// / gs:// refs are unaffected.
+func WithTrustedPublicOrigin(origin string) AtomMediaSignerOption {
+	return func(s *AtomMediaSigner) {
+		s.trustedPublicOrigin = strings.TrimSpace(origin)
+	}
+}
+
 // DefaultSignTimeout exposes the per-call sign deadline default so the
 // handler/tests can assert + main.go can log the effective value.
 func DefaultSignTimeout() time.Duration {
@@ -84,12 +111,37 @@ type AtomMediaSigner struct {
 	presign     *s3.PresignClient
 	bucket      string
 	signTimeout time.Duration
+
+	// transientBucket is the short-lived generated-image bucket a
+	// re-homeable http(s) ref must live in (env ATOM_MEDIA_TRANSIENT_BUCKET).
+	transientBucket string
+
+	// trustedPublicOrigin, when set, is the only host an http(s) ref may
+	// be served from (env ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN).
+	trustedPublicOrigin string
 }
 
 // NewAtomMediaSigner constructs the adapter from the environment
 // (S3_ENDPOINT / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / S3_REGION /
 // S3_FORCE_PATH_STYLE). Returns ErrAtomMediaSignerNotWired when bucket
 // is empty.
+//
+// Two further env vars configure reference CLASSIFICATION (see
+// ClassifyReference):
+//
+//   - ATOM_MEDIA_TRANSIENT_BUCKET — the short-lived generated-image bucket
+//     the durable copy sources from. Unset ⇒ durable s3:// / gs:// refs
+//     still classify, but an http(s) ref fails loud ("transient bucket is
+//     not configured") instead of guessing one.
+//   - ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN — the origin that issues the
+//     transient presigned URLs. REQUIRED for http(s) references: unset ⇒
+//     every http(s) ref fails loud ("trusted public origin is not
+//     configured"), because an unauthenticated host is not a copy source we
+//     can trust. Boot is unaffected; durable refs and text questions keep
+//     working.
+//
+// Both can be overridden per-call via WithTransientBucket /
+// WithTrustedPublicOrigin.
 func NewAtomMediaSigner(bucket string, opts ...AtomMediaSignerOption) (*AtomMediaSigner, error) {
 	if strings.TrimSpace(bucket) == "" {
 		return nil, fmt.Errorf("atom-media S3 bucket not set: %w", ports.ErrAtomMediaSignerNotWired)
@@ -133,10 +185,12 @@ func NewAtomMediaSigner(bucket string, opts ...AtomMediaSignerOption) (*AtomMedi
 	})
 
 	s := &AtomMediaSigner{
-		client:      client,
-		presign:     s3.NewPresignClient(client),
-		bucket:      bucket,
-		signTimeout: defaultSignTimeoutValue,
+		client:              client,
+		presign:             s3.NewPresignClient(client),
+		bucket:              bucket,
+		signTimeout:         defaultSignTimeoutValue,
+		transientBucket:     strings.TrimSpace(os.Getenv("ATOM_MEDIA_TRANSIENT_BUCKET")),
+		trustedPublicOrigin: strings.TrimSpace(os.Getenv("ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN")),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -213,8 +267,12 @@ func (s *AtomMediaSigner) Sign(ctx context.Context, atomID, tenantID string, in 
 // atom prefix groups the atom's media; the object_id (UUIDv7) avoids
 // collision on re-mint; ext lets a downstream consumer probe MIME
 // without re-introspection.
+//
+// The per-tenant prefix comes from ports.TenantMediaPrefix — the single
+// definition of the ownership boundary, shared with the transient keys qgen
+// writes (`tenants/{tenant}/jobs/{job}/{file}`) that a re-home sources from.
 func AtomMediaKey(tenantID, atomID, objectID, ext string) string {
-	return "tenants/" + tenantID + "/atoms/" + atomID + "/" + objectID + "." + ext
+	return ports.TenantMediaPrefix(tenantID) + "atoms/" + atomID + "/" + objectID + "." + ext
 }
 
 // AtomMediaURI joins bucket + key into a canonical s3:// URI.

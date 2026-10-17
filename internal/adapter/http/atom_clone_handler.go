@@ -88,15 +88,51 @@ func (h *AtomHandler) cloneAtom(w http.ResponseWriter, r *http.Request, atomID s
 		writeError(w, http.StatusBadRequest, "CREATION_INVALID_ATOM", err.Error())
 		return
 	}
+
+	// 4. Prepare the cloned question's payloads and apply the media policy BEFORE
+	// anything is persisted — a refusal must leave no half-built clone behind.
+	//
+	// The payloads are COPIED, not aliased: the media policy re-homes image refs
+	// IN PLACE, and the source aggregate must never be mutated (ADR-199). A
+	// shallow copy suffices — only the *string image fields are rewritten.
+	//
+	// The clone is a WRITE seam. The source lookup is tenant-scoped, but that
+	// only proves the SOURCE ROW is the caller's; it says nothing about the
+	// historical media refs that row carries. So the copied refs get the same
+	// classification + ownership check every other seam applies, and a
+	// legitimate transient ref is re-homed to durable storage before the first
+	// revision is written (otherwise the clone inherits an image that expires
+	// with the 7-day transient TTL).
+	var cloneMCQ *question.MCQPayload
+	var cloneOE *question.OEPayload
+	if srcQ != nil {
+		if srcQ.MCQ != nil {
+			cp := *srcQ.MCQ
+			cloneMCQ = &cp
+		}
+		if srcQ.OE != nil {
+			cp := *srcQ.OE
+			cloneOE = &cp
+		}
+		if err := guardMediaPayload(r.Context(), h.reHomer, h.mediaDownloadSigner,
+			tenantID, clone.AtomID, srcQ.Type, cloneMCQ, cloneOE); err != nil {
+			log.Printf("cloneAtom: media policy: %v", err)
+			writeError(w, http.StatusInternalServerError, "CREATION_ATOM_MEDIA_REHOME_FAILED",
+				"failed to durably re-home images")
+			return
+		}
+	}
+
 	if err := h.repo.Save(r.Context(), clone); err != nil {
 		log.Printf("cloneAtom: save atom: %v", err)
 		writeError(w, http.StatusInternalServerError, "CREATION_REPO_ERROR", "failed to persist cloned atom")
 		return
 	}
 
-	// 4. Clone the source's question onto the new atom (reusing the up-front load).
+	// 5. Clone the source's question onto the new atom (reusing the up-front load
+	// and the already-validated payloads).
 	if srcQ != nil {
-		if err := h.cloneQuestionOnto(r, clone.AtomID, tenantID, gcid, srcQ); err != nil {
+		if err := h.cloneQuestionOnto(r, clone.AtomID, tenantID, gcid, srcQ, cloneMCQ, cloneOE); err != nil {
 			log.Printf("cloneAtom: clone question: %v", err)
 			writeError(w, http.StatusInternalServerError, "CREATION_REPO_ERROR",
 				"cloned atom saved but question clone failed — retry")
@@ -109,7 +145,9 @@ func (h *AtomHandler) cloneAtom(w http.ResponseWriter, r *http.Request, atomID s
 
 // cloneQuestionOnto re-creates srcQ (Type + Prompt + payload) as a NEW question
 // on newAtomID authored by the caller, persisting it + its first revision.
-func (h *AtomHandler) cloneQuestionOnto(r *http.Request, newAtomID, tenantID, gcid string, srcQ *question.Question) error {
+// mcq / oe are the CALLER's copies of the source payloads, already through
+// guardMediaPayload — the source question is never mutated or re-read here.
+func (h *AtomHandler) cloneQuestionOnto(r *http.Request, newAtomID, tenantID, gcid string, srcQ *question.Question, mcq *question.MCQPayload, oe *question.OEPayload) error {
 	newQ, err := question.New(question.NewParams{
 		TenantID:   tenantID,
 		AtomID:     newAtomID,
@@ -117,8 +155,8 @@ func (h *AtomHandler) cloneQuestionOnto(r *http.Request, newAtomID, tenantID, gc
 		Type:       srcQ.Type,
 		Prompt:     srcQ.Prompt,
 		SourceType: atom.SourceManual,
-		MCQ:        srcQ.MCQ,
-		OE:         srcQ.OE,
+		MCQ:        mcq,
+		OE:         oe,
 	})
 	if err != nil {
 		return err

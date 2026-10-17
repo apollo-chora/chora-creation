@@ -85,8 +85,21 @@ type QuestionJobsHandler struct {
 	// reHomer durably re-homes an accepted candidate's transient W8 images into
 	// chora-atom-media BEFORE the first revision is persisted (ADR-210), so the
 	// accepted question is durable from creation. Shared with the atom +
-	// questions handlers; nil ⇒ re-home is skipped (images stay transient).
+	// questions handlers; nil ⇒ the COPY is skipped (images stay transient).
 	reHomer *questionImageReHomer
+
+	// mediaSigner is the storage adapter's download signer. It is used ONLY to
+	// enforce tenant ownership when reHomer is nil (see guardMediaPayload) — the
+	// ownership check must not depend on the copier being wired. Nil ⇒ no
+	// storage adapter is configured at all.
+	mediaSigner ports.AtomMediaDownloadSigner
+}
+
+// SetMediaSigner wires the storage adapter's download signer, used to enforce
+// tenant media ownership independently of the re-homer. Optional: a nil signer
+// leaves ownership enforcement to the re-homer.
+func (h *QuestionJobsHandler) SetMediaSigner(s ports.AtomMediaDownloadSigner) {
+	h.mediaSigner = s
 }
 
 // SetBlobStore wires the GCS BlobStore for the P6 batch path. Nil
@@ -2021,18 +2034,17 @@ func (h *QuestionJobsHandler) acceptQuestionJob(w http.ResponseWriter, r *http.R
 
 		// ADR-210 — durably re-home the candidate's transient W8 images into
 		// chora-atom-media BEFORE persisting, so the accepted question's first
-		// revision carries durable gs:// refs that survive the 7-day transient
-		// TTL. Done pre-persist (not append-after) so a copy failure aborts this
-		// candidate before any atom/question row is written — no orphaned draft
-		// that would force a duplicate on retry. The defer above refunds the
-		// accept-time mana. Fail-loud.
-		if h.reHomer != nil {
-			if err := h.reHomer.ReHomePayloadImages(r.Context(), tenantID, targetAtomID, qType, mcq, oe); err != nil {
-				log.Printf("question-jobs: media re-home (accept): %v", err)
-				writeError(w, http.StatusInternalServerError, "CREATION_ATOM_MEDIA_REHOME_FAILED",
-					"failed to durably re-home images")
-				return
-			}
+		// revision carries durable refs that survive the 7-day transient
+		// TTL. Done pre-persist (not append-after) so a refusal aborts this
+		// candidate before any question/revision row is written — no orphaned
+		// draft that would force a duplicate on retry. The defer above refunds
+		// the accept-time mana. Fail-loud. The OWNERSHIP half does not depend on
+		// the copier being wired — see guardMediaPayload.
+		if err := guardMediaPayload(r.Context(), h.reHomer, h.mediaSigner, tenantID, targetAtomID, qType, mcq, oe); err != nil {
+			log.Printf("question-jobs: media policy (accept): %v", err)
+			writeError(w, http.StatusInternalServerError, "CREATION_ATOM_MEDIA_REHOME_FAILED",
+				"failed to durably re-home images")
+			return
 		}
 
 		// Build the Question + first revision (source=ai_assist) on the

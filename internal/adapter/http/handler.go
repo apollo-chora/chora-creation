@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -81,16 +82,17 @@ type AtomHandler struct {
 
 	// OT#4 / ADR-210 — shared W8 durable image re-home. Transient 7-day signed
 	// image URLs in the question payload are copied into the durable
-	// chora-atom-media bucket and rewritten to a gs:// ref at every SAVE seam
-	// (publish, save-revision, accept) so a saved-but-unpublished image
-	// survives the transient TTL. Nil ⇒ re-home is skipped (images stay
-	// transient). The same instance is shared with the questions + jobs handlers.
+	// chora-atom-media bucket and rewritten to a durable object ref (s3:// on the
+	// S3 adapter) at every SAVE seam (publish, save-revision, accept) so a
+	// saved-but-unpublished image survives the transient TTL. Nil ⇒ re-home is
+	// skipped (images stay transient). The same instance is shared with the
+	// questions + jobs handlers.
 	reHomer *questionImageReHomer
 
 	// OT#4 — authoring-read mint-on-read. When a question payload holds a
-	// durable gs:// image ref, getQuestion resolves it to a fresh short-lived
-	// signed GET URL so the author's <img> renders. Nil ⇒ gs:// refs are
-	// returned raw.
+	// durable atom-media ref the signer can mint, getQuestion resolves it to a
+	// fresh short-lived signed GET URL so the author's <img> renders. Nil ⇒ a
+	// durable ref is DROPPED from the projection (logged), never returned raw.
 	mediaDownloadSigner ports.AtomMediaDownloadSigner
 
 	// Epic-1b W4 — on atom publish, asynchronously embed the atom's text into
@@ -186,9 +188,10 @@ type RouterDeps struct {
 	// OT#4 — W8 durable image re-home + authoring-read download signer.
 	// MediaReHomer copies transient images into chora-atom-media on atom
 	// publish; AtomMediaDownloadSigner mints fresh GET URLs over the durable
-	// gs:// refs at authoring read-time. Both are satisfied by the same GCS
-	// adapter (the *gcs.AtomMediaSigner). Nil ⇒ the respective behaviour is
-	// skipped (re-home no-ops; gs:// refs return raw).
+	// object refs at authoring read-time. Both are satisfied by the same
+	// storage adapter (the S3-compatible *mediastore.AtomMediaSigner). Nil ⇒ the
+	// respective behaviour is skipped (re-home no-ops; a durable ref is dropped
+	// from the projection, never returned raw).
 	MediaReHomer            ports.MediaReHomer
 	AtomMediaDownloadSigner ports.AtomMediaDownloadSigner
 
@@ -367,9 +370,9 @@ func NewRouterWithDeps(deps RouterDeps) http.Handler {
 
 	}
 	// OT#4 / ADR-210 — build the shared durable image re-home service over the
-	// GCS copier + question repo, and wire it into all three SAVE seams
-	// (publish here on AtomHandler, plus the questions + jobs handlers below).
-	// Nil when either dep is absent (each seam then no-ops; images stay
+	// storage adapter's MediaReHomer + question repo, and wire it into all three
+	// SAVE seams (publish here on AtomHandler, plus the questions + jobs handlers
+	// below). Nil when either dep is absent (each seam then no-ops; images stay
 	// transient).
 	var reHomer *questionImageReHomer
 	if deps.MediaReHomer != nil && deps.QuestionRepository != nil {
@@ -393,6 +396,9 @@ func NewRouterWithDeps(deps RouterDeps) http.Handler {
 		)
 		// ADR-210 — durably re-home a candidate's transient images at accept.
 		h.jobsHandler.reHomer = reHomer
+		// ADR-210 — the same storage adapter's signer, so the accept seam's
+		// tenant ownership check still runs when the re-homer is unwired.
+		h.jobsHandler.SetMediaSigner(deps.AtomMediaDownloadSigner)
 		// P6 — BlobStore is optional. When nil the multipart batch path
 		// 503s; the JSON ai_draft path stays available.
 		h.jobsHandler.SetBlobStore(deps.BlobStore)
@@ -1122,12 +1128,13 @@ func (h *AtomHandler) projectAtomWithQuestion(ctx context.Context, a *atom.Learn
 		if serr != nil {
 			return nil, fmt.Errorf("mcq is not servable: %w", serr)
 		}
-		// CHO-1638 — mint the QUESTION illustration's durable gs:// ref to a
-		// fresh signed GET URL for the learner-safe projection. The question
-		// image is safe on every learner surface (atomic-session take, active
-		// duel); the model-answer illustration (q.MCQ.AnswerImageURL) is NEVER
-		// read here, so it can never leak to a learner pre-grade (Security-wins).
-		signedQImg := h.signQuestionImage(ctx, q.MCQ.ImageURL)
+		// CHO-1638 — mint the QUESTION illustration's durable ref (s3:// on the
+		// S3 adapter) to a fresh signed GET URL for the learner-safe projection.
+		// The question image is safe on every learner surface (atomic-session
+		// take, active duel); the model-answer illustration
+		// (q.MCQ.AnswerImageURL) is NEVER read here, so it can never leak to a
+		// learner pre-grade (Security-wins).
+		signedQImg := h.signQuestionImage(ctx, a.TenantID, q.MCQ.ImageURL)
 		mcqEnvelope := map[string]any{
 			"question_id": q.QuestionID,
 			"prompt":      q.Prompt,
@@ -1192,32 +1199,87 @@ func (h *AtomHandler) projectAtomWithQuestion(ctx context.Context, a *atom.Learn
 	return envelope, nil
 }
 
-// signQuestionImage mints a durable gs:// QUESTION illustration ref to a fresh
-// short-lived signed GET URL for the LEARNER-safe projection. Mirrors the
+// signQuestionImage mints a durable atom-media QUESTION illustration ref to a
+// fresh short-lived signed GET URL for the LEARNER-safe projection. Mirrors the
 // author getQuestion mint (questions_handler.mintMediaRef) but is ONLY ever
 // called with the QUESTION image — the model-answer illustration is never
-// projected to learners (Security-wins). A transient https ref passes through;
-// a nil/empty ref, an unwired signer, or a mint failure drops the ref to nil so
-// a raw gs:// is NEVER emitted to the wire.
-func (h *AtomHandler) signQuestionImage(ctx context.Context, ref *string) *string {
+// projected to learners (Security-wins). EVERY non-empty ref — durable URI or
+// transient http(s) URL — is first classified and ownership-checked against
+// the caller's tenant namespace; only an OWNED durable ref is then minted and
+// an OWNED transient http(s) ref passes through. A nil/empty ref, an unwired
+// signer, a foreign-tenant ref, or a mint failure drops the ref to nil so a
+// raw durable URI is NEVER emitted to the wire. Whether a ref is durable is the
+// SIGNER's answer (IsDurableRef) — this call site does not know the storage
+// scheme.
+func (h *AtomHandler) signQuestionImage(ctx context.Context, tenantID string, ref *string) *string {
 	if ref == nil || *ref == "" {
 		return nil
 	}
-	if !strings.HasPrefix(*ref, "gs://") {
-		// Transient https ref (draft, pre-publish) — already fetchable.
+	if h.mediaDownloadSigner == nil {
+		// No signer wired: a durable ref cannot be minted, so it is dropped
+		// rather than emitted raw. A transient http(s) ref is already
+		// fetchable and passes through. The drop is LOGGED because the request
+		// still succeeds — without it a misconfigured deployment shows a
+		// silently missing illustration. This is the documented
+		// external-image-mode policy (see question_media_rehome.go), not a
+		// silent assertion that the ref is safe: ownership is simply not
+		// classifiable without a storage adapter.
+		if !isFetchableMediaRef(*ref) {
+			log.Printf("getAtom: media download signer NOT wired — dropping question image ref %s from the learner projection",
+				redactMediaRef(*ref))
+			return nil
+		}
 		return ref
 	}
-	if h.mediaDownloadSigner == nil {
-		// No signer wired — never emit a raw gs:// to a learner.
+	// OWNERSHIP FIRST — before anything is signed or passed through.
+	// SignDownloadURL scopes on BUCKET only, and the durable bucket is shared
+	// by every tenant, so a stored ref is served only when this tenant owns
+	// its object key. The check runs on EVERY non-empty ref, not just durable
+	// ones: TenantOwnsRef classifies a transient http(s) URL exactly like a
+	// durable URI, so a pre-existing payload carrying ANOTHER tenant's
+	// transient object on the trusted origin is refused here too — passed
+	// through before this fix. Defence in depth against a legacy row that
+	// predates the write-seam guards.
+	if owns, oerr := h.mediaDownloadSigner.TenantOwnsRef(ctx, tenantID, *ref); oerr != nil || !owns {
+		log.Printf("getAtom: dropping question image ref %s from the learner projection — not owned by tenant %q (err=%v)",
+			redactMediaRef(*ref), tenantID, oerr)
 		return nil
+	}
+	if !h.mediaDownloadSigner.IsDurableRef(*ref) {
+		// Owned transient http(s) ref: already fetchable; pass through
+		// unchanged. Ownership is established above, so this is safe.
+		return ref
 	}
 	signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
 	if err != nil {
-		log.Printf("getAtom: mint learner question-image gs-uri=%s: %v (dropping)", *ref, err)
+		log.Printf("getAtom: mint learner question-image ref=%s: %v (dropping)", redactMediaRef(*ref), err)
 		return nil
 	}
 	url := signed.URL
 	return &url
+}
+
+// isFetchableMediaRef reports whether ref is already an http(s) URL the browser
+// can fetch directly — the transient signed-URL shape the orchestrator stamps on
+// a draft. A durable atom-media ref is NOT fetchable: it must be minted by the
+// download signer, or dropped. Read paths ask this instead of testing a storage
+// scheme themselves.
+func isFetchableMediaRef(ref string) bool {
+	return strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://")
+}
+
+// redactMediaRef returns ref safe to log: any userinfo, query string and
+// fragment are stripped, so a presigned URL's signature (a credential) never
+// reaches the logs.
+func redactMediaRef(ref string) string {
+	u, err := url.Parse(ref)
+	if err != nil {
+		return "<unparseable media reference>"
+	}
+	u.User = nil
+	u.RawQuery, u.ForceQuery = "", false
+	u.Fragment, u.RawFragment = "", ""
+	return u.String()
 }
 
 // oeMaxScore returns the OE max achievable score. Derived from the

@@ -17,8 +17,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -883,13 +886,81 @@ func TestGetQuestionByID_ReturnsAuthorProjection_FullPayload(t *testing.T) {
 	}
 }
 
-// fakeDownloadSigner is a test double for ports.AtomMediaDownloadSigner.
+// fakeDownloadSigner is a test double for ports.AtomMediaDownloadSigner. It
+// mirrors the S3 adapter's reference grammar: a well-formed
+// s3://chora-atom-media-dev/<key> ref is durable; an http(s) URL, a foreign
+// bucket, an empty string, or a malformed ref is not.
 type fakeDownloadSigner struct {
 	fn func(ctx context.Context, gsURI string) (ports.SignedDownloadURL, error)
 }
 
 func (f fakeDownloadSigner) SignDownloadURL(ctx context.Context, gsURI string) (ports.SignedDownloadURL, error) {
 	return f.fn(ctx, gsURI)
+}
+
+func (f fakeDownloadSigner) IsDurableRef(ref string) bool {
+	rest, ok := strings.CutPrefix(ref, "s3://")
+	if !ok {
+		return false
+	}
+	bucket, key, ok := strings.Cut(rest, "/")
+	return ok && bucket == "chora-atom-media-dev" && key != ""
+}
+
+// TenantOwnsRef mirrors the adapter's ownership gate: the ref's object key must
+// sit under the caller's own tenants/{tenantID}/ namespace.
+func (f fakeDownloadSigner) TenantOwnsRef(_ context.Context, tenantID, ref string) (bool, error) {
+	key, ok := fakeMediaKey(ref)
+	if !ok {
+		return false, fmt.Errorf("unclassifiable media reference %q", ref)
+	}
+	return strings.HasPrefix(key, ports.TenantMediaPrefix(tenantID)), nil
+}
+
+// fakeMediaKey extracts the object key from the reference shapes this double
+// accepts — `s3://chora-atom-media-dev/<key>` and a path-style
+// `https://storage.googleapis.com/chora-ai-assist-images-dev/<key>`.
+func fakeMediaKey(ref string) (string, bool) {
+	if rest, ok := strings.CutPrefix(ref, "s3://"); ok {
+		bucket, key, ok := strings.Cut(rest, "/")
+		return key, ok && bucket == "chora-atom-media-dev" && key != ""
+	}
+	u, err := url.Parse(ref)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", false
+	}
+	bucket, key, ok := strings.Cut(strings.TrimPrefix(u.Path, "/"), "/")
+	return key, ok && bucket == "chora-ai-assist-images-dev" && key != ""
+}
+
+// syncLogBuffer is a race-safe io.Writer for capturing the standard logger
+// while sibling tests log concurrently.
+type syncLogBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncLogBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncLogBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// captureLog redirects the standard logger into a buffer for the duration of
+// the test and returns a func reporting everything written so far.
+func captureLog(t *testing.T) func() string {
+	t.Helper()
+	prev := log.Writer()
+	buf := &syncLogBuffer{}
+	log.SetOutput(buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return buf.String
 }
 
 // seedMCQAtom seeds an MCQ atom and returns a router wired with the given
@@ -915,9 +986,9 @@ func seedMCQAtomWithSigner(t *testing.T, signer ports.AtomMediaDownloadSigner) (
 }
 
 // CHO-1638 — the AUTHOR re-open projection (GET /questions/{id}) must mint
-// durable gs:// image refs to fresh signed GET URLs (an <img> can't carry a
-// bearer JWT; a published atom stores the canonical gs:// ref). RED before
-// getQuestion learns to mint.
+// durable image refs to fresh signed GET URLs (an <img> can't carry a bearer
+// JWT; a published atom stores the canonical durable ref — s3:// on the S3
+// adapter). RED before getQuestion learns to mint.
 func TestGetQuestionByID_MintsDurableImageRefs(t *testing.T) {
 	t.Parallel()
 	var signedURIs []string
@@ -927,8 +998,8 @@ func TestGetQuestionByID_MintsDurableImageRefs(t *testing.T) {
 	}}
 	srv, atomID := seedMCQAtomWithSigner(t, signer)
 
-	stemGS := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
-	ansGS := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/ans.png"
+	stemURI := "s3://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
+	ansURI := "s3://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/ans.png"
 	body := map[string]any{
 		"type":   "mcq",
 		"prompt": "Identify the condensation stage.",
@@ -938,8 +1009,8 @@ func TestGetQuestionByID_MintsDurableImageRefs(t *testing.T) {
 				{"option_id": "b", "label": "Evaporation", "is_correct": false, "explainer": "No"},
 			},
 		},
-		"image_url":        stemGS,
-		"answer_image_url": ansGS,
+		"image_url":        stemURI,
+		"answer_image_url": ansURI,
 	}
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
@@ -966,8 +1037,8 @@ func TestGetQuestionByID_MintsDurableImageRefs(t *testing.T) {
 	if !strings.HasPrefix(gotAns, "https://signed.example/") {
 		t.Errorf("answer_image_url not minted: got %q", gotAns)
 	}
-	if strings.HasPrefix(gotImg, "gs://") || strings.HasPrefix(gotAns, "gs://") {
-		t.Errorf("raw gs:// leaked to the wire: img=%q ans=%q", gotImg, gotAns)
+	if strings.HasPrefix(gotImg, "s3://") || strings.HasPrefix(gotAns, "s3://") {
+		t.Errorf("raw durable URI leaked to the wire: img=%q ans=%q", gotImg, gotAns)
 	}
 	// Author projection still carries is_correct + explainer.
 	first := mcq["options"].([]any)[0].(map[string]any)
@@ -979,8 +1050,40 @@ func TestGetQuestionByID_MintsDurableImageRefs(t *testing.T) {
 	}
 }
 
-// A transient https ref (draft atom, pre-publish) must pass through unchanged
-// and the signer must NOT be invoked for it.
+// seedQuestionRefsDirect seeds an MCQ atom + question carrying the given image
+// refs DIRECTLY into the repo, bypassing the create seam.
+//
+// The read-path tests below need a STORED ref the write seam would now refuse —
+// a legacy gs:// ref, a foreign bucket, or a bare transient URL with no tenant
+// namespace. The projection must still be exercised against exactly those, so
+// the fixture writes the row the way legacy data looks rather than through the
+// guarded POST route.
+func seedQuestionRefsDirect(t *testing.T, signer ports.AtomMediaDownloadSigner, img, ans string) (http.Handler, ports.QuestionRepository, string) {
+	t.Helper()
+	atomRepo := inmem.NewAtomRepository()
+	qRepo := newFakeQRepo()
+	a, err := atom.New(atom.NewParams{
+		TenantID: tenantA, Gcid: gcidA, Title: "Img atom", Body: "b", Mode: atom.ModeStraightUp,
+	})
+	if err != nil {
+		t.Fatalf("seed atom: %v", err)
+	}
+	a.QuestionType = atom.AtomType("mcq")
+	if err := atomRepo.Save(context.Background(), a); err != nil {
+		t.Fatalf("save atom: %v", err)
+	}
+	seedMCQWithImages(t, qRepo, a.AtomID, img, ans)
+	srv := httpadapter.NewRouterWithDeps(httpadapter.RouterDeps{
+		Repo: atomRepo, QuestionRepository: qRepo, AtomMediaDownloadSigner: signer,
+	})
+	return srv, qRepo, a.AtomID
+}
+
+// A transient https ref (draft atom, pre-publish) that the caller's tenant
+// OWNS passes through unchanged — the signer must NOT be invoked for it. The
+// ownership gate runs on every ref before either minting or pass-through, so
+// the fixture must carry the caller's own tenant namespace (a transient ref
+// with none is dropped, not passed through).
 func TestGetQuestionByID_PassesThroughTransientHTTPS(t *testing.T) {
 	t.Parallel()
 	called := false
@@ -988,29 +1091,15 @@ func TestGetQuestionByID_PassesThroughTransientHTTPS(t *testing.T) {
 		called = true
 		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
 	}}
-	srv, atomID := seedMCQAtomWithSigner(t, signer)
-	transient := "https://storage.googleapis.com/chora-ai-assist-images-dev/x.png?X-Goog-Expires=604800"
-	body := map[string]any{
-		"type":   "mcq",
-		"prompt": "p",
-		"mcq_payload": map[string]any{
-			"options": []map[string]any{
-				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
-				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
-			},
-		},
-		"image_url": transient,
+	transient := "https://storage.googleapis.com/chora-ai-assist-images-dev/tenants/" + tenantA + "/jobs/j1/stem.png?X-Goog-Expires=604800"
+	srv, qRepo, atomID := seedQuestionRefsDirect(t, signer, transient, "")
+
+	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("seed GetByAtomID: %v", err)
 	}
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", w.Code, w.Body.String())
-	}
-	var created map[string]any
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
-	qID := created["question"].(map[string]any)["question_id"].(string)
 	w2 := httptest.NewRecorder()
-	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+qID, nil))
+	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+q.QuestionID, nil))
 	var fetched map[string]any
 	_ = json.Unmarshal(w2.Body.Bytes(), &fetched)
 	mcq := fetched["question"].(map[string]any)["mcq"].(map[string]any)
@@ -1022,8 +1111,8 @@ func TestGetQuestionByID_PassesThroughTransientHTTPS(t *testing.T) {
 	}
 }
 
-// On mint failure the durable ref is dropped (never a raw gs:// on the wire)
-// and the endpoint still returns 200.
+// On mint failure the durable ref is dropped (never a raw durable URI on the
+// wire) and the endpoint still returns 200.
 func TestGetQuestionByID_MintFailureDropsRef_Still200(t *testing.T) {
 	t.Parallel()
 	signer := fakeDownloadSigner{fn: func(_ context.Context, gsURI string) (ports.SignedDownloadURL, error) {
@@ -1039,7 +1128,7 @@ func TestGetQuestionByID_MintFailureDropsRef_Still200(t *testing.T) {
 				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
 			},
 		},
-		"image_url": "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png",
+		"image_url": "s3://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png",
 	}
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
@@ -1055,9 +1144,133 @@ func TestGetQuestionByID_MintFailureDropsRef_Still200(t *testing.T) {
 	_ = json.Unmarshal(w2.Body.Bytes(), &fetched)
 	mcq := fetched["question"].(map[string]any)["mcq"].(map[string]any)
 	if v, present := mcq["image_url"]; present {
-		if s, _ := v.(string); strings.HasPrefix(s, "gs://") {
-			t.Errorf("raw gs:// leaked after mint failure: %q", s)
+		if s, _ := v.(string); strings.HasPrefix(s, "s3://") {
+			t.Errorf("raw durable URI leaked after mint failure: %q", s)
 		}
+	}
+}
+
+// A ref naming a bucket the signer is not configured for is NOT durable — the
+// signer must not be asked to mint it, and it must never reach the wire raw.
+func TestGetQuestionByID_ForeignBucketRefDropped(t *testing.T) {
+	t.Parallel()
+	called := false
+	signer := fakeDownloadSigner{fn: func(_ context.Context, gsURI string) (ports.SignedDownloadURL, error) {
+		called = true
+		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
+	}}
+	foreign := "s3://some-other-bucket/tenants/" + tenantA + "/atoms/x/stem.png"
+	srv, qRepo, atomID := seedQuestionRefsDirect(t, signer, foreign, "")
+
+	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("seed GetByAtomID: %v", err)
+	}
+	w2 := httptest.NewRecorder()
+	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+q.QuestionID, nil))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("get: %d %s", w2.Code, w2.Body.String())
+	}
+	var fetched map[string]any
+	_ = json.Unmarshal(w2.Body.Bytes(), &fetched)
+	mcq := fetched["question"].(map[string]any)["mcq"].(map[string]any)
+	if s, _ := mcq["image_url"].(string); s != "" {
+		t.Errorf("foreign-bucket ref must be dropped, got %q", s)
+	}
+	if called {
+		t.Errorf("signer must NOT be asked to mint a foreign-bucket ref")
+	}
+}
+
+// A LEGACY gs:// durable ref (written by an earlier GCS-era deployment) is not
+// a scheme this adapter can sign, so the author projection DROPS it: the image
+// disappears from the response rather than being emitted raw. The stored
+// reference is untouched — recovering those images needs a data migration.
+func TestGetQuestionByID_LegacyGSRefDropped(t *testing.T) {
+	t.Parallel()
+	called := false
+	signer := fakeDownloadSigner{fn: func(_ context.Context, gsURI string) (ports.SignedDownloadURL, error) {
+		called = true
+		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
+	}}
+	legacy := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
+	srv, qRepo, atomID := seedQuestionRefsDirect(t, signer, legacy, "")
+
+	q, _, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID)
+	if err != nil {
+		t.Fatalf("seed GetByAtomID: %v", err)
+	}
+	w2 := httptest.NewRecorder()
+	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+q.QuestionID, nil))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("get: %d %s", w2.Code, w2.Body.String())
+	}
+	var fetched map[string]any
+	_ = json.Unmarshal(w2.Body.Bytes(), &fetched)
+	mcq := fetched["question"].(map[string]any)["mcq"].(map[string]any)
+	got, _ := mcq["image_url"].(string)
+	if got == legacy {
+		t.Errorf("raw legacy gs:// ref emitted to the wire: %q", got)
+	}
+	if got != "" {
+		t.Errorf("legacy gs:// ref must be dropped from the projection, got %q", got)
+	}
+	if called {
+		t.Errorf("signer must NOT be asked to sign a scheme it cannot mint")
+	}
+	// The stored reference itself is untouched — only the projection drops it.
+	if _, rev, err := qRepo.GetByAtomID(context.Background(), tenantA, atomID); err != nil {
+		t.Fatalf("GetByAtomID: %v", err)
+	} else if rev.MCQPayload == nil || rev.MCQPayload.ImageURL == nil || *rev.MCQPayload.ImageURL != legacy {
+		t.Errorf("stored ref = %v; want the legacy ref %q untouched", rev.MCQPayload, legacy)
+	}
+}
+
+// With the signer unwired a durable ref is dropped, never emitted raw — and the
+// drop is LOGGED so a misconfigured deployment (a successful response with a
+// silently missing illustration) is diagnosable.
+func TestGetQuestionByID_UnwiredSignerDropsDurableRef(t *testing.T) {
+	gotLog := captureLog(t)
+	srv, atomID := seedMCQAtomWithSigner(t, nil)
+	body := map[string]any{
+		"type":   "mcq",
+		"prompt": "p",
+		"mcq_payload": map[string]any{
+			"options": []map[string]any{
+				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
+				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
+			},
+		},
+		"image_url": "s3://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png",
+	}
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	var created map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	qID := created["question"].(map[string]any)["question_id"].(string)
+	w2 := httptest.NewRecorder()
+	srv.ServeHTTP(w2, authedJSON(http.MethodGet, "/api/atoms/"+atomID+"/questions/"+qID, nil))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("get: %d %s", w2.Code, w2.Body.String())
+	}
+	var fetched map[string]any
+	_ = json.Unmarshal(w2.Body.Bytes(), &fetched)
+	mcq := fetched["question"].(map[string]any)["mcq"].(map[string]any)
+	if s, _ := mcq["image_url"].(string); s != "" {
+		t.Errorf("durable ref with an unwired signer must be dropped, got %q", s)
+	}
+
+	// Diagnosability: the drop is logged, names the missing wiring, and does
+	// not carry the stored ref's path beyond what is needed to identify it.
+	logged := gotLog()
+	if !strings.Contains(logged, "media download signer NOT wired") {
+		t.Errorf("expected a 'signer NOT wired' log line; got:\n%s", logged)
+	}
+	if !strings.Contains(logged, "chora-atom-media-dev") {
+		t.Errorf("log should identify the dropped ref's bucket; got:\n%s", logged)
 	}
 }
 

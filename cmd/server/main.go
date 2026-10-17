@@ -799,24 +799,6 @@ func main() {
 			questionRepo != nil, bus != nil)
 	}
 
-	// ADR-229 Amendment A1 (CHO-2132) — orphan-edition mint. Consumes
-	// chora.sharing.atom_reuse.orphan_required.v1 (sharing's grant table is
-	// the authoritative stranded-consumer registry), mints the singleton
-	// orphan edition + clones its question + repoints creation's own
-	// non-author collection entries, then answers with
-	// chora.creation.atom.orphan_created.v1 via the durable outbox.
-	if orphanAtoms != nil && orphanQuestions != nil && bus != nil {
-		orphanSub := pubsubadapter.NewOrphanRequiredSubscriber(pubsubadapter.OrphanRequiredConfig{
-			Atoms:     orphanAtoms,
-			Questions: orphanQuestions,
-			Publisher: publisher,
-		})
-		registerOrphanRequiredSubscriber(ctx, bus, orphanSub)
-	} else {
-		log.Printf("creation: orphan_required subscriber NOT wired — missing deps (pgRepos=%v, bus=%v)",
-			orphanAtoms != nil && orphanQuestions != nil, bus != nil)
-	}
-
 	// ATOM Phase 1 (ADR-156) — atom-media V4 signed URL minter wiring.
 	// Bucket name comes from env ATOM_MEDIA_BUCKET. Per
 	// feedback_no_inline_config + feedback_no_stubs_real_wiring: empty env
@@ -824,8 +806,15 @@ func main() {
 	// CREATION_ATOM_MEDIA_NOT_WIRED. NO stub fallback.
 	//
 	// The adapter presigns PUT/GET URLs against S3-compatible storage
-	// (MinIO / S3) using static credentials from the environment
+	// (MinIO / Garage / S3) using static credentials from the environment
 	// (S3_ENDPOINT / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY).
+	//
+	// Re-homing a generated image additionally needs ATOM_MEDIA_TRANSIENT_BUCKET
+	// (the bucket the copy sources from) and ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN
+	// (the origin that issued the transient presigned URL). The origin is
+	// REQUIRED for http(s) refs: unset, ClassifyReference refuses every one of
+	// them rather than trusting an arbitrary host, and an image accept fails
+	// loud. Boot, text questions and already-durable refs are unaffected.
 	var atomMediaSigner ports.AtomMediaSigner
 	atomMediaBucket := strings.TrimSpace(os.Getenv("ATOM_MEDIA_BUCKET"))
 	if atomMediaBucket == "" {
@@ -859,6 +848,30 @@ func main() {
 	if atomMediaSigner != nil {
 		mediaReHomer = atomMediaSigner.(ports.MediaReHomer)
 		mediaDownloadSigner = atomMediaSigner.(ports.AtomMediaDownloadSigner)
+	}
+
+	// ADR-229 Amendment A1 (CHO-2132) — orphan-edition mint. Consumes
+	// chora.sharing.atom_reuse.orphan_required.v1 (sharing's grant table is
+	// the authoritative stranded-consumer registry), mints the singleton
+	// orphan edition + clones its question + repoints creation's own
+	// non-author collection entries, then answers with
+	// chora.creation.atom.orphan_created.v1 via the durable outbox.
+	//
+	// The orphan clone re-persists the source revision's stored refs, so the
+	// download signer rides along for their OWNERSHIP-ONLY validation (no
+	// copier — this path has no caller-supplied input); nil (no bucket wired)
+	// is the documented external-image mode, not a misconfiguration.
+	if orphanAtoms != nil && orphanQuestions != nil && bus != nil {
+		orphanSub := pubsubadapter.NewOrphanRequiredSubscriber(pubsubadapter.OrphanRequiredConfig{
+			Atoms:       orphanAtoms,
+			Questions:   orphanQuestions,
+			Publisher:   publisher,
+			MediaSigner: mediaDownloadSigner,
+		})
+		registerOrphanRequiredSubscriber(ctx, bus, orphanSub)
+	} else {
+		log.Printf("creation: orphan_required subscriber NOT wired — missing deps (pgRepos=%v, bus=%v)",
+			orphanAtoms != nil && orphanQuestions != nil, bus != nil)
 	}
 
 	// CHO-2142 — atom topic classifier for the topic-tag backfill. Dials
@@ -965,7 +978,8 @@ func main() {
 		// POST /api/atoms/{id}/media 503s CREATION_ATOM_MEDIA_NOT_WIRED.
 		AtomMediaSigner: atomMediaSigner,
 		// OT#4 — durable W8 image re-home on publish + authoring-read
-		// mint-on-read. Nil ⇒ re-home no-ops + gs:// refs return raw.
+		// mint-on-read. Nil ⇒ re-home no-ops + durable refs are dropped from
+		// the projections (never emitted raw).
 		MediaReHomer:            mediaReHomer,
 		AtomMediaDownloadSigner: mediaDownloadSigner,
 		// WS-6a-wiring — Personal Collections (2026-05-26).
@@ -1121,8 +1135,9 @@ func main() {
 	creationServer := creationgrpc.NewCreationServer(creationgrpc.Deps{
 		Atoms:     atomRepo,
 		Questions: questionRepo,
-		// OT#4 — MintAtomMediaDownloadURL signs durable atom-media gs:// refs
-		// for chora-delivery's learner mint-on-read. Nil ⇒ RPC 503s.
+		// OT#4 — MintAtomMediaDownloadURL signs durable atom-media object refs
+		// (s3:// for the S3 adapter) for chora-delivery's learner mint-on-read.
+		// Nil ⇒ RPC 503s.
 		DownloadSigner: mediaDownloadSigner,
 		// ADR-229 WS-2 (CHO-2133) — SnapshotQuestionByID reuse gate. Nil ⇒
 		// caller_gcid-bearing non-owner snapshots refuse FAILED_PRECONDITION

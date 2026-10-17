@@ -20,6 +20,7 @@ package pubsub
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/apollo-chora/chora-creation/internal/adapter/outbox"
 	"github.com/apollo-chora/chora-creation/internal/domain/atom"
 	"github.com/apollo-chora/chora-creation/internal/domain/question"
+	"github.com/apollo-chora/chora-creation/internal/ports"
 )
 
 const (
@@ -186,6 +188,28 @@ func newSubscriberForTest(atoms *fakeOrphanAtoms, questions *fakeOrphanQuestions
 		Questions: questions,
 		Publisher: pub,
 	})
+}
+
+// fakeMediaSigner classifies s3://chora-atom-media-dev/<key> refs for
+// ownership, mirroring the S3 adapter's grammar. SignDownloadURL exists only
+// to satisfy the port — the orphan path validates ownership and NEVER signs
+// or copies.
+type fakeMediaSigner struct{}
+
+func (f *fakeMediaSigner) SignDownloadURL(_ context.Context, gsURI string) (ports.SignedDownloadURL, error) {
+	return ports.SignedDownloadURL{}, fmt.Errorf("orphan path never signs: %q", gsURI)
+}
+
+func (f *fakeMediaSigner) IsDurableRef(ref string) bool {
+	return strings.HasPrefix(ref, "s3://chora-atom-media-dev/")
+}
+
+func (f *fakeMediaSigner) TenantOwnsRef(_ context.Context, tenantID, ref string) (bool, error) {
+	key, ok := strings.CutPrefix(ref, "s3://chora-atom-media-dev/")
+	if !ok || key == "" {
+		return false, fmt.Errorf("unclassifiable media reference %q", ref)
+	}
+	return strings.HasPrefix(key, ports.TenantMediaPrefix(tenantID)), nil
 }
 
 // --- tests ---------------------------------------------------------------------
@@ -475,5 +499,92 @@ func TestDecodeOrphanRequired_BinaryProto(t *testing.T) {
 	if _, err := DecodeOrphanRequired(eventbus.Message{Payload: []byte("{json}")}); err == nil ||
 		!strings.Contains(err.Error(), "orphan_required") {
 		t.Fatalf("garbage payload must fail loud with topic context; err = %v", err)
+	}
+}
+
+// --- orphan media ownership -----------------------------------------------------
+
+// A LEGACY revision carrying a foreign-tenant ref must not be re-persisted
+// onto the orphan unchecked: the orphan path has no caller-supplied input, so
+// ownership classification is the only defence against copying a legacy
+// foreign ref into a NEW question revision.
+func TestOrphanRequired_LegacyForeignTenantRefNotRePersisted(t *testing.T) {
+	atoms, questions, pub := newFakeOrphanAtoms(), newFakeOrphanQuestions(), &fakeOrphanPublisher{}
+	seedOriginal(atoms, questions)
+
+	foreign := "s3://chora-atom-media-dev/tenants/someone-else/atoms/a1/secret.png"
+	questions.revs[orAtomID].MCQPayload.ImageURL = &foreign
+
+	sub := NewOrphanRequiredSubscriber(OrphanRequiredConfig{
+		Atoms:       atoms,
+		Questions:   questions,
+		Publisher:   pub,
+		MediaSigner: &fakeMediaSigner{},
+	})
+	err := sub.HandleOrphanRequired(context.Background(), orphanRequiredEvent("narrowed"))
+	if err == nil {
+		t.Fatal("a legacy foreign-tenant ref must be refused (NACK), not re-persisted onto the orphan")
+	}
+	if !strings.Contains(err.Error(), "namespace") {
+		t.Errorf("error = %v; want a namespace/ownership refusal", err)
+	}
+	// The orphan question was never saved — no revision carries the foreign ref.
+	if len(questions.saved) != 0 {
+		t.Errorf("orphan question saved %d times; want 0 — the foreign ref must not be re-persisted", len(questions.saved))
+	}
+	for id, q := range questions.byAtomID {
+		if id == orAtomID || q == nil || q.MCQ == nil {
+			continue
+		}
+		if img := q.MCQ.ImageURL; img != nil && *img != "" {
+			t.Errorf("orphan question for atom %s carries image ref %q; want none", id, *img)
+		}
+	}
+}
+
+// With the signer wired, an OWN-tenant durable ref is re-persisted fine —
+// the ownership gate must not break the orphan mint's happy path, and no copy
+// or sign is attempted (ownership-only validation).
+func TestOrphanRequired_OwnTenantRefClonedWithSigner(t *testing.T) {
+	atoms, questions, pub := newFakeOrphanAtoms(), newFakeOrphanQuestions(), &fakeOrphanPublisher{}
+	seedOriginal(atoms, questions)
+
+	own := "s3://chora-atom-media-dev/tenants/" + orTenant + "/atoms/a1/stem.png"
+	questions.revs[orAtomID].MCQPayload.ImageURL = &own
+
+	sub := NewOrphanRequiredSubscriber(OrphanRequiredConfig{
+		Atoms:       atoms,
+		Questions:   questions,
+		Publisher:   pub,
+		MediaSigner: &fakeMediaSigner{},
+	})
+	if err := sub.HandleOrphanRequired(context.Background(), orphanRequiredEvent("narrowed")); err != nil {
+		t.Fatalf("an own-tenant ref must clone fine: %v", err)
+	}
+	if len(questions.saved) != 1 {
+		t.Fatalf("saved = %d; want 1 (the orphan question carrying the own-tenant ref)", len(questions.saved))
+	}
+	if got := questions.saved[0].MCQ.ImageURL; got == nil || *got != own {
+		t.Errorf("cloned ref = %v; want the unchanged own-tenant ref %q", got, own)
+	}
+}
+
+// With NO storage adapter wired (nil signer — the documented external-image
+// mode) the orphan path has no grammar to classify with, so refs pass through
+// unchecked, exactly as on the HTTP write seams. Pinned so the mode stays
+// explicit rather than drifting into a silent assertion of safety.
+func TestOrphanRequired_NilSignerSkipsOwnershipCheck(t *testing.T) {
+	atoms, questions, pub := newFakeOrphanAtoms(), newFakeOrphanQuestions(), &fakeOrphanPublisher{}
+	seedOriginal(atoms, questions)
+
+	foreign := "s3://chora-atom-media-dev/tenants/someone-else/atoms/a1/secret.png"
+	questions.revs[orAtomID].MCQPayload.ImageURL = &foreign
+
+	sub := newSubscriberForTest(atoms, questions, pub) // no MediaSigner
+	if err := sub.HandleOrphanRequired(context.Background(), orphanRequiredEvent("narrowed")); err != nil {
+		t.Fatalf("external-image mode (nil signer) clones unchecked by design: %v", err)
+	}
+	if len(questions.saved) != 1 {
+		t.Fatalf("saved = %d; want 1", len(questions.saved))
 	}
 }

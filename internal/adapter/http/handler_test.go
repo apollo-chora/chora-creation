@@ -725,8 +725,9 @@ func TestGetAtom_QuestionPayload_MCQ_LearnerSafe(t *testing.T) {
 // atomic-session / duels read) and the legacy mcq_payload shim, while NEVER
 // projecting the model-answer illustration (Security-wins: a learner taking the
 // assessment must not see the answer image pre-grade). The question image is
-// minted from its durable gs:// ref exactly like the author getQuestion path.
-// RED before the learner projection learns to mint the question image.
+// minted from its durable ref (s3:// on the S3 adapter) exactly like the author
+// getQuestion path. RED before the learner projection learns to mint the
+// question image.
 func TestGetAtom_QuestionPayload_MCQ_QuestionImageOnly(t *testing.T) {
 	t.Parallel()
 	var signedURIs []string
@@ -736,8 +737,8 @@ func TestGetAtom_QuestionPayload_MCQ_QuestionImageOnly(t *testing.T) {
 	}}
 	srv, atomID := seedMCQAtomWithSigner(t, signer)
 
-	stemGS := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
-	ansGS := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/ans.png"
+	stemURI := "s3://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
+	ansURI := "s3://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/ans.png"
 	body := map[string]any{
 		"type":   "mcq",
 		"prompt": "Identify the condensation stage.",
@@ -748,8 +749,8 @@ func TestGetAtom_QuestionPayload_MCQ_QuestionImageOnly(t *testing.T) {
 			},
 			"xp_on_correct": 50,
 		},
-		"image_url":        stemGS,
-		"answer_image_url": ansGS,
+		"image_url":        stemURI,
+		"answer_image_url": ansURI,
 	}
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
@@ -776,8 +777,8 @@ func TestGetAtom_QuestionPayload_MCQ_QuestionImageOnly(t *testing.T) {
 	if !strings.HasPrefix(qImg, "https://signed.example/") {
 		t.Errorf("question_payload.image_url not minted; got %q", qImg)
 	}
-	if strings.HasPrefix(qImg, "gs://") {
-		t.Errorf("raw gs:// question image leaked to the wire: %q", qImg)
+	if strings.HasPrefix(qImg, "s3://") {
+		t.Errorf("raw durable URI question image leaked to the wire: %q", qImg)
 	}
 	if _, present := qp["answer_image_url"]; present {
 		t.Errorf("SECURITY: question_payload leaked answer_image_url to learner projection: %v", qp["answer_image_url"])
@@ -800,8 +801,126 @@ func TestGetAtom_QuestionPayload_MCQ_QuestionImageOnly(t *testing.T) {
 	if len(signedURIs) != 1 {
 		t.Errorf("expected exactly 1 mint call (question image only); got %d: %v", len(signedURIs), signedURIs)
 	}
-	if len(signedURIs) == 1 && signedURIs[0] != stemGS {
-		t.Errorf("signed the wrong ref; got %q want %q", signedURIs[0], stemGS)
+	if len(signedURIs) == 1 && signedURIs[0] != stemURI {
+		t.Errorf("signed the wrong ref; got %q want %q", signedURIs[0], stemURI)
+	}
+}
+
+// With the download signer unwired a durable ref is dropped from the learner
+// projection, never emitted raw.
+func TestGetAtom_UnwiredSignerDropsDurableImageRef(t *testing.T) {
+	t.Parallel()
+	srv, atomID := seedMCQAtomWithSigner(t, nil)
+	body := map[string]any{
+		"type":   "mcq",
+		"prompt": "p",
+		"mcq_payload": map[string]any{
+			"options": []map[string]any{
+				{"option_id": "a", "label": "A", "is_correct": true, "explainer": "y"},
+				{"option_id": "b", "label": "B", "is_correct": false, "explainer": "n"},
+			},
+		},
+		"image_url": "s3://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png",
+	}
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, authedJSON(http.MethodPost, "/api/atoms/"+atomID+"/questions", body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("seed q: %d %s", w.Code, w.Body.String())
+	}
+	w2 := httptest.NewRecorder()
+	srv.ServeHTTP(w2, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("GET atom: %d %s", w2.Code, w2.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(w2.Body.Bytes(), &got); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	qp, ok := got["question_payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected question_payload; got %s", w2.Body.String())
+	}
+	if s, _ := qp["image_url"].(string); s != "" {
+		t.Errorf("durable ref with an unwired signer must be dropped, got %q", s)
+	}
+}
+
+// A transient http(s) ref that the caller's tenant OWNS is already fetchable
+// and passes through the learner projection unchanged — the signer is not
+// consulted. (The ownership gate runs before pass-through, so the fixture
+// carries the caller's own tenant namespace; a transient ref with none is
+// dropped, not passed through.)
+func TestGetAtom_TransientImagePassesThrough(t *testing.T) {
+	t.Parallel()
+	called := false
+	signer := fakeDownloadSigner{fn: func(_ context.Context, gsURI string) (ports.SignedDownloadURL, error) {
+		called = true
+		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
+	}}
+	transient := "https://storage.googleapis.com/chora-ai-assist-images-dev/tenants/" + tenantA + "/jobs/j1/stem.png?X-Goog-Expires=604800"
+	// Seeded DIRECTLY (the fixture bypasses the write seam): the learner
+	// projection must still pass an owned, fetchable http(s) ref through
+	// unchanged, so the stored row is written directly.
+	srv, _, atomID := seedQuestionRefsDirect(t, signer, transient, "")
+	w2 := httptest.NewRecorder()
+	srv.ServeHTTP(w2, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("GET atom: %d %s", w2.Code, w2.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(w2.Body.Bytes(), &got); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	qp, ok := got["question_payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected question_payload; got %s", w2.Body.String())
+	}
+	if qp["image_url"] != transient {
+		t.Errorf("transient https should pass through unchanged: got %v", qp["image_url"])
+	}
+	if called {
+		t.Errorf("signer must NOT be called for a transient https ref")
+	}
+}
+
+// A LEGACY gs:// durable ref (written by an earlier GCS-era deployment) is not
+// a scheme the S3 adapter can sign, so the learner projection DROPS it: the
+// illustration disappears rather than being emitted raw. The stored reference is
+// untouched — recovering those images needs a data migration, not a grammar
+// change here.
+func TestGetAtom_LegacyGSRefDropped(t *testing.T) {
+	t.Parallel()
+	called := false
+	signer := fakeDownloadSigner{fn: func(_ context.Context, gsURI string) (ports.SignedDownloadURL, error) {
+		called = true
+		return ports.SignedDownloadURL{URL: "https://should-not-be-used/", ExpiresAt: time.Now()}, nil
+	}}
+	legacy := "gs://chora-atom-media-dev/tenants/" + tenantA + "/atoms/x/stem.png"
+	// Seeded DIRECTLY: the create seam now refuses a legacy scheme, so the
+	// learner projection has to be exercised against a stored legacy row.
+	srv, _, atomID := seedQuestionRefsDirect(t, signer, legacy, "")
+	w2 := httptest.NewRecorder()
+	srv.ServeHTTP(w2, authedReq(http.MethodGet, "/api/atoms/"+atomID, nil))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("GET atom: %d %s", w2.Code, w2.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(w2.Body.Bytes(), &got); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	qp, ok := got["question_payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected question_payload; got %s", w2.Body.String())
+	}
+	img, _ := qp["image_url"].(string)
+	if img == legacy {
+		t.Errorf("raw legacy gs:// ref emitted to the wire: %q", img)
+	}
+	if img != "" {
+		t.Errorf("legacy gs:// ref must be dropped from the learner projection, got %q", img)
+	}
+	if called {
+		t.Errorf("signer must NOT be asked to sign a scheme it cannot mint")
 	}
 }
 

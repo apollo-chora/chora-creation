@@ -1,7 +1,7 @@
 // publish_atom_rehome_test.go — OT#4 TDD: publishing an atom whose question
 // carries transient W8 image URLs re-homes them into durable storage and
-// rewrites the latest revision's payload to a gs:// ref. Uses the REAL
-// mediarehome.Service over a fake MediaReHomer (server-side GCS copy).
+// rewrites the latest revision's payload to a durable ref. Uses the REAL
+// mediarehome.Service over a fake MediaReHomer (server-side object copy).
 package httpadapter_test
 
 import (
@@ -20,7 +20,10 @@ import (
 	"github.com/apollo-chora/chora-creation/internal/ports"
 )
 
-const reHomeDurableBucket = "chora-atom-media-dev"
+const (
+	reHomeDurableBucket   = "chora-atom-media-dev"
+	reHomeTransientBucket = "chora-ai-assist-images-dev"
+)
 
 // fakeReHomer is a ports.MediaReHomer that records copies + returns a
 // deterministic durable gs:// URI per call.
@@ -31,6 +34,50 @@ type fakeReHomer struct {
 }
 
 func (f *fakeReHomer) DurableBucket() string { return reHomeDurableBucket }
+
+// ClassifyReference mirrors the production adapter's grammar: a durable
+// bucket ref (gs:// / s3://) is Durable, a path-style http(s) URL on the
+// transient bucket is Transient, anything else is an error.
+func (f *fakeReHomer) ClassifyReference(_ context.Context, raw string) (ports.MediaReference, error) {
+	ref := strings.TrimSpace(raw)
+	for _, scheme := range []string{"s3://", "gs://"} {
+		if strings.HasPrefix(ref, scheme) {
+			rest := ref[len(scheme):]
+			i := strings.IndexByte(rest, '/')
+			if i <= 0 || i >= len(rest)-1 {
+				return ports.MediaReference{}, fmt.Errorf("malformed %s URI: %q", scheme, ref)
+			}
+			bucket, key := rest[:i], rest[i+1:]
+			if bucket != reHomeDurableBucket {
+				return ports.MediaReference{}, fmt.Errorf("foreign %s bucket %q", scheme, bucket)
+			}
+			return ports.MediaReference{Kind: ports.MediaReferenceDurable, Bucket: bucket, Key: key}, nil
+		}
+	}
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		path := ref
+		if q := strings.IndexByte(path, '?'); q >= 0 {
+			path = path[:q] // strip the presign signature
+		}
+		schemeEnd := strings.Index(path, "://") + 3
+		path = strings.TrimPrefix(path[schemeEnd:], "/")
+		hostEnd := strings.IndexByte(path, '/')
+		if hostEnd < 0 {
+			return ports.MediaReference{}, fmt.Errorf("malformed media URL: %q", ref)
+		}
+		path = path[hostEnd+1:]
+		i := strings.IndexByte(path, '/')
+		if i <= 0 || i >= len(path)-1 {
+			return ports.MediaReference{}, fmt.Errorf("malformed path-style media URL: %q", ref)
+		}
+		bucket, key := path[:i], path[i+1:]
+		if bucket != reHomeTransientBucket {
+			return ports.MediaReference{}, fmt.Errorf("foreign http bucket %q", bucket)
+		}
+		return ports.MediaReference{Kind: ports.MediaReferenceTransient, Bucket: bucket, Key: key}, nil
+	}
+	return ports.MediaReference{}, fmt.Errorf("unrecognized media reference %q", ref)
+}
 
 func (f *fakeReHomer) CopyToDurable(_ context.Context, p ports.CopyToDurableParams) (string, error) {
 	if f.err != nil {

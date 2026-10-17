@@ -50,8 +50,9 @@ type QuestionsHandler struct {
 	// eventing); production ALWAYS wires deps.JobEventPublisher.
 	publisher JobEventPublisher
 	// mediaDownloadSigner mints fresh short-lived signed GET URLs for durable
-	// gs:// atom-media refs on the author re-open projection (CHO-1638). May be
-	// nil in tests / when the signer is not wired — minting is then a no-op.
+	// atom-media refs on the author re-open projection (CHO-1638). May be nil in
+	// tests / when the signer is not wired — a durable ref is then DROPPED from
+	// the projection (logged), never returned raw.
 	mediaDownloadSigner ports.AtomMediaDownloadSigner
 	// savedAtomFetcher fetches the caller bookmarked atom IDs from
 	// chora-sharing for the picker saved disjunct (ux_unified_atom_picker.md).
@@ -72,9 +73,9 @@ type QuestionsHandler struct {
 }
 
 // NewQuestionsHandler constructs the handler over the two repository ports plus
-// the (optional) atom-media download signer used to mint durable gs:// image
-// refs on the author projection and the sharing-backed consent fetchers for
-// the picker's saved + granted disjuncts (ADR-229 WS-2).
+// the (optional) atom-media download signer used to mint durable atom-media
+// image refs on the author projection and the sharing-backed consent fetchers
+// for the picker's saved + granted disjuncts (ADR-229 WS-2).
 func NewQuestionsHandler(repo ports.QuestionRepository, atomRepo atom.Repository, signer ports.AtomMediaDownloadSigner, publisher JobEventPublisher, savedFetcher ports.SavedAtomIDFetcher, reuseFetcher ports.ReuseContextFetcher) *QuestionsHandler {
 	return &QuestionsHandler{repo: repo, atomRepo: atomRepo, mediaDownloadSigner: signer, publisher: publisher, savedAtomFetcher: savedFetcher, reuseContext: reuseFetcher}
 }
@@ -820,6 +821,23 @@ func (h *QuestionsHandler) createQuestion(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// 2b. ADR-210 — the same media treatment the publish, save-revision, accept
+	// and clone seams apply, on the CREATE seam too. Every image ref this
+	// handler can persist (mcq/oe image_url + answer_image_url) is classified
+	// and ownership-checked against the caller's own tenant namespace BEFORE
+	// anything is written: a foreign-tenant ref — durable OR transient — is
+	// refused here, so no question row, no revision and no S3 copy result. An
+	// own-tenant transient ref is re-homed to a durable one in place, so it
+	// survives the 7-day transient TTL instead of 404ing after it. Fail-loud,
+	// with the same envelope as the other seams. The OWNERSHIP half does not
+	// depend on the copier being wired — see guardMediaPayload.
+	if err := guardMediaPayload(r.Context(), h.reHomer, h.mediaDownloadSigner, tenantID, atomID, qType, mcq, oe); err != nil {
+		log.Printf("questions: media policy (create): %v", err)
+		writeError(w, http.StatusInternalServerError, "CREATION_ATOM_MEDIA_REHOME_FAILED",
+			"failed to durably re-home images")
+		return
+	}
+
 	// 3. Construct the aggregate + first revision.
 	q, err := question.New(question.NewParams{
 		TenantID:   tenantID,
@@ -917,6 +935,39 @@ func (h *QuestionsHandler) patchQuestion(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	// The EFFECTIVE payload for the revision this edit will write. When the
+	// request omitted the payload, buildPatchPayloadFromRequest returns nil and
+	// ApplyUpdate would carry the PREVIOUS revision's payload forward — so
+	// materialise a COPY of it here. The copy (never the stored pointer) is what
+	// the media policy below sees and mutates: the repo's struct must stay
+	// untouched, but the guard has to see the refs the edit would carry forward,
+	// otherwise a prompt-only PATCH re-persists a foreign-tenant ref that the
+	// pre-append guard never looked at.
+	if mcq == nil && q.Type == question.TypeMCQ && q.MCQ != nil {
+		cp := *q.MCQ
+		mcq = &cp
+	}
+	if oe == nil && q.Type == question.TypeOpenEnded && q.OE != nil {
+		cp := *q.OE
+		oe = &cp
+	}
+
+	// ADR-210 — the same media treatment the other seams apply, moved BEFORE
+	// the append so a rejected reference leaves no revision behind. Every ref
+	// the EFFECTIVE payload carries (freshly supplied or carried forward) is
+	// classified and ownership-checked against the caller's own tenant
+	// namespace, and an own-tenant transient ref is re-homed in place — so the
+	// revision appended below already carries a durable ref. A foreign-tenant
+	// ref (durable OR transient) fails loud HERE, before AppendRevision: no
+	// revision row, no S3 copy. The OWNERSHIP half does not depend on the
+	// copier being wired — see guardMediaPayload.
+	if err := guardMediaPayload(r.Context(), h.reHomer, h.mediaDownloadSigner, tenantID, atomID, q.Type, mcq, oe); err != nil {
+		log.Printf("questions: media policy (patch): %v", err)
+		writeError(w, http.StatusInternalServerError, "CREATION_ATOM_MEDIA_REHOME_FAILED",
+			"failed to durably re-home images")
+		return
+	}
+
 	// Apply the update. ApplyUpdate produces a NEW *Question + a new *QuestionRevision.
 	updated, newRev, err := q.ApplyUpdate(question.UpdateParams{
 		Prompt:     req.Prompt,
@@ -941,11 +992,15 @@ func (h *QuestionsHandler) patchQuestion(w http.ResponseWriter, r *http.Request,
 	updated.LatestRevisionID = newRev.RevisionID
 	updated.Revision = newRev.RevisionNumber
 
-	// ADR-210 — durably re-home the revision's transient W8 images into
-	// chora-atom-media at save, so a saved-but-unpublished image survives the
-	// 7-day transient bucket TTL (completes CHO-1974). Append-only: on a
-	// rewrite this appends a further revision carrying the durable gs:// refs
-	// (idempotent — an already-durable ref is a no-op). Fail-loud.
+	// ADR-210 — second pass over the APPENDED revision. After the pre-append
+	// re-home above its refs are already durable, so this is normally a no-op;
+	// it still repairs the one path that bypasses it — a payload-omitting edit
+	// (mcq_payload/oe_payload absent ⇒ the previous revision's payload is
+	// carried forward), whose refs the pre-append pass never saw. That path
+	// carries no NEW caller-supplied ref, so it cannot introduce a foreign one;
+	// it can only re-persist a ref already stored. Reference-level idempotent —
+	// an already-durable ref is a no-op; the bytes are not deduplicated.
+	// Fail-loud.
 	if h.reHomer != nil {
 		rehomed, changed, rerr := h.reHomer.ReHomeRevision(r.Context(), tenantID, atomID, updated, newRev)
 		if rerr != nil {
@@ -1004,49 +1059,90 @@ func (h *QuestionsHandler) getQuestion(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	// CHO-1638 — an <img> can't carry a bearer JWT, and a PUBLISHED atom stores
-	// the canonical durable gs:// ref, so the raw value never renders on the
-	// author re-open. Mint the durable refs to fresh short-lived signed GET URLs
-	// (transient https refs from draft atoms pass through). Never mutate the
-	// repo's struct — mint over a shallow copy.
+	// the canonical durable object ref (s3:// on the S3 adapter), so the raw
+	// value never renders on the author re-open. Mint the durable refs to fresh
+	// short-lived signed GET URLs (transient https refs from draft atoms pass
+	// through). Never mutate the repo's struct — mint over a shallow copy.
 	writeJSON(w, http.StatusOK, questionWithRevisionResponse{Question: h.mintQuestionMedia(r.Context(), q), Revision: rev})
 }
 
 // mintQuestionMedia returns a shallow copy of q whose MCQ/OE ImageURL +
-// AnswerImageURL durable gs:// refs are resolved to fresh signed GET URLs for
-// the authoring re-open path. Transient https refs pass through unchanged. On
-// a mint failure the ref is dropped (nil) and logged — a raw gs:// is NEVER
-// emitted to the wire — and the response is still served. A nil signer (tests /
-// unwired) makes this a no-op.
+// AnswerImageURL durable refs are resolved to fresh signed GET URLs for the
+// authoring re-open path. Owned transient http(s) refs pass through unchanged.
+// On a mint failure the ref is dropped (nil) and logged — and so is any ref
+// that is neither mintable nor fetchable — so a raw durable URI is NEVER emitted
+// to the wire. The response is still served. A nil signer (tests / unwired)
+// still drops durable refs rather than emitting them raw.
 func (h *QuestionsHandler) mintQuestionMedia(ctx context.Context, q *question.Question) *question.Question {
-	if q == nil || h.mediaDownloadSigner == nil {
+	if q == nil {
 		return q
 	}
 	out := *q
 	if q.MCQ != nil {
 		mcq := *q.MCQ
-		mcq.ImageURL = h.mintMediaRef(ctx, q.MCQ.ImageURL)
-		mcq.AnswerImageURL = h.mintMediaRef(ctx, q.MCQ.AnswerImageURL)
+		mcq.ImageURL = h.mintMediaRef(ctx, q.TenantID, q.MCQ.ImageURL)
+		mcq.AnswerImageURL = h.mintMediaRef(ctx, q.TenantID, q.MCQ.AnswerImageURL)
 		out.MCQ = &mcq
 	}
 	if q.OE != nil {
 		oe := *q.OE
-		oe.ImageURL = h.mintMediaRef(ctx, q.OE.ImageURL)
-		oe.AnswerImageURL = h.mintMediaRef(ctx, q.OE.AnswerImageURL)
+		oe.ImageURL = h.mintMediaRef(ctx, q.TenantID, q.OE.ImageURL)
+		oe.AnswerImageURL = h.mintMediaRef(ctx, q.TenantID, q.OE.AnswerImageURL)
 		out.OE = &oe
 	}
 	return &out
 }
 
-// mintMediaRef resolves a single image ref: a durable gs:// ref is minted to a
-// fresh signed GET URL; a transient https ref (or empty/nil) passes through;
-// a mint failure drops the ref to nil (never a raw gs:// on the wire).
-func (h *QuestionsHandler) mintMediaRef(ctx context.Context, ref *string) *string {
-	if ref == nil || *ref == "" || !strings.HasPrefix(*ref, "gs://") {
+// mintMediaRef resolves a single image ref: EVERY non-empty ref — durable
+// atom-media URI OR transient http(s) URL — is first classified and
+// ownership-checked against the caller's own tenant namespace. A durable ref
+// the tenant owns is then minted to a fresh signed GET URL; an OWNED transient
+// http(s) ref passes through unchanged. A mint failure, a ref the tenant does
+// not own, and any ref that is neither mintable nor fetchable are dropped to
+// nil — never a raw durable URI, never an unowned URL, on the wire. This call
+// site does not know the storage scheme.
+func (h *QuestionsHandler) mintMediaRef(ctx context.Context, tenantID string, ref *string) *string {
+	if ref == nil || *ref == "" {
+		return ref
+	}
+	if h.mediaDownloadSigner == nil {
+		// No signer wired: a durable ref cannot be minted, so it is dropped
+		// rather than emitted raw; a transient http(s) ref is already
+		// fetchable. The drop is LOGGED because the request still succeeds —
+		// without it a misconfigured deployment shows a silently missing
+		// illustration on the author re-open. This is the documented
+		// external-image-mode policy (see question_media_rehome.go), not a
+		// silent assertion that the ref is safe: ownership is simply not
+		// classifiable without a storage adapter.
+		if !isFetchableMediaRef(*ref) {
+			log.Printf("getQuestion: media download signer NOT wired — dropping ref %s from the author projection",
+				redactMediaRef(*ref))
+			return nil
+		}
+		return ref
+	}
+	// OWNERSHIP FIRST — before anything is signed or passed through.
+	// SignDownloadURL scopes on BUCKET only and the durable bucket is shared
+	// by every tenant, so a stored ref is served only when this tenant owns
+	// its object key. The check runs on EVERY non-empty ref, not just durable
+	// ones: TenantOwnsRef classifies a transient http(s) URL exactly like a
+	// durable URI, so a pre-existing payload carrying ANOTHER tenant's
+	// transient object on the trusted origin is refused here too — passed
+	// through before this fix. Defence in depth against a legacy row that
+	// predates the write-seam guards.
+	if owns, oerr := h.mediaDownloadSigner.TenantOwnsRef(ctx, tenantID, *ref); oerr != nil || !owns {
+		log.Printf("getQuestion: dropping ref %s from the author projection — not owned by tenant %q (err=%v)",
+			redactMediaRef(*ref), tenantID, oerr)
+		return nil
+	}
+	if !h.mediaDownloadSigner.IsDurableRef(*ref) {
+		// Owned transient http(s) ref: already fetchable; pass through
+		// unchanged. Ownership is established above, so this is safe.
 		return ref
 	}
 	signed, err := h.mediaDownloadSigner.SignDownloadURL(ctx, *ref)
 	if err != nil {
-		log.Printf("getQuestion: mint atom-media gs-uri=%s: %v (dropping from author projection)", *ref, err)
+		log.Printf("getQuestion: mint atom-media ref=%s: %v (dropping from author projection)", redactMediaRef(*ref), err)
 		return nil
 	}
 	url := signed.URL
@@ -1218,7 +1314,7 @@ func rubricFromWireCriteria(in []createRubricCriterion) *question.Rubric {
 // image_url/answer_image_url) silently dropped the AI-assist images (CHO-1974).
 func resolvePatchImageRef(wire, prev *string) *string {
 	if wire == nil {
-		return prev // omitted ⇒ keep the prior image (durable gs:// ref)
+		return prev // omitted ⇒ keep the prior image (a durable object ref)
 	}
 	if *wire == "" {
 		return nil // explicit clear (Remove)
