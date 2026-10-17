@@ -8,8 +8,10 @@
 // DURABLE `chora-atom-media-{env}` bucket (365-day → Coldline lifecycle,
 // no delete) so a published atom's images survive past 7 days.
 //
-// The copy is a same-region server-side GCS object copy — no bytes transit
-// the pod. The concrete GCS adapter satisfies this port.
+// The copy is a same-region server-side object copy — no bytes transit the
+// pod. The concrete storage adapter (S3-compatible: MinIO / Garage / S3)
+// satisfies this port and owns the storage-URL grammar + validation for the
+// buckets it is configured with.
 package ports
 
 import "context"
@@ -21,7 +23,7 @@ import "context"
 // owning atom + the file extension.
 type CopyToDurableParams struct {
 	// SrcBucket / SrcKey locate the source object in the transient bucket
-	// (parsed by the re-home service from the stored signed URL).
+	// (supplied by the re-home service from ClassifyReference).
 	SrcBucket string
 	SrcKey    string
 
@@ -36,17 +38,46 @@ type CopyToDurableParams struct {
 	Ext string
 }
 
+// MediaReferenceKind discriminates a classified storage reference: a
+// TRANSIENT object (still in the short-lived generated-image bucket — copy
+// it) from an already-DURABLE one (in the atom-media bucket — leave it).
+type MediaReferenceKind int
+
+const (
+	// MediaReferenceTransient names an object in the transient
+	// generated-image bucket. The service copies it to durable storage.
+	MediaReferenceTransient MediaReferenceKind = iota
+
+	// MediaReferenceDurable names an object already in the durable
+	// atom-media bucket. The service leaves the ref untouched.
+	MediaReferenceDurable
+)
+
+// MediaReference is a storage reference the adapter has validated against
+// its configured origins + buckets, split into the coordinates a copy needs.
+type MediaReference struct {
+	Kind   MediaReferenceKind
+	Bucket string
+	Key    string
+}
+
 // MediaReHomer copies a transient image object into the durable atom-media
-// bucket and returns the canonical `gs://` URI of the durable copy.
+// bucket and returns the canonical durable URI of the copy.
 type MediaReHomer interface {
+	// ClassifyReference validates raw against the configured storage
+	// origins and buckets and reports whether it names a transient object
+	// (copy it) or an already-durable one (leave it). An unknown,
+	// malformed, foreign or otherwise unauthorised reference is an error.
+	ClassifyReference(ctx context.Context, raw string) (MediaReference, error)
+
 	// CopyToDurable performs a same-region server-side copy of
 	// SrcBucket/SrcKey into the durable bucket under a freshly-minted
-	// per-atom key, returning the durable gs:// URI. Fail-loud on any
-	// storage error (a partially-published atom is surfaced, not hidden).
+	// per-atom key, returning the durable URI (s3:// for the S3 adapter,
+	// gs:// for a GCS one). Fail-loud on any storage error (a
+	// partially-published atom is surfaced, not hidden).
 	CopyToDurable(ctx context.Context, p CopyToDurableParams) (gsURI string, err error)
 
 	// DurableBucket returns the destination (durable atom-media) bucket
-	// name — used by the re-home service for the idempotency check (a ref
-	// already in the durable bucket is left untouched).
+	// name — the bucket ClassifyReference authorises durable refs against.
 	DurableBucket() string
 }

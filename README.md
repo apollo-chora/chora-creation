@@ -97,6 +97,8 @@ Configuration is environment-driven. The main settings are:
 | `S3_REGION` | S3 region | `us-east-1` |
 | `S3_FORCE_PATH_STYLE` | Force S3 path-style addressing | `false` unless set |
 | `ATOM_MEDIA_BUCKET` | Durable atom-media bucket | unset |
+| `ATOM_MEDIA_TRANSIENT_BUCKET` | Transient generated-image bucket re-homed from | unset (http(s) refs fail loud) |
+| `ATOM_MEDIA_TRUSTED_PUBLIC_ORIGIN` | Only host an http(s) media ref may come from | unset (any host) |
 | `GCS_BUCKET_BATCH_UPLOADS` | Batch source-material bucket | unset |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP trace endpoint | unset |
 | `SVC_IDENTITY_GRPC_URL` | chora-identity gRPC target | unset |

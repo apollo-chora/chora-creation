@@ -1,12 +1,21 @@
 // rehome_test.go — TDD for the W8 image re-home service (OT#4). The
-// service decides, given a stored image URL, whether to copy the bytes
-// into durable storage and what durable gs:// ref to persist. The actual
-// GCS copy is a port (ports.MediaReHomer) faked here.
+// service decides, given a stored image reference, whether to copy the
+// bytes into durable storage and what durable ref to persist. Both the
+// storage-URL grammar (ClassifyReference) and the copy itself are port
+// operations (ports.MediaReHomer) faked here.
+//
+// The fake mirrors the production adapter: durable refs are s3:// (the S3
+// adapter's scheme), the transient source is a Garage/S3-style path-style
+// presigned http URL, and classification failures are errors — so a
+// regression in the decision layer cannot hide behind a fake that answers
+// gs:// for everything.
 package mediarehome_test
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -14,13 +23,20 @@ import (
 	"github.com/apollo-chora/chora-creation/internal/ports"
 )
 
-const durableBucket = "chora-atom-media-dev"
+const (
+	durableBucket   = "chora-atom-media-dev"
+	transientBucket = "chora-ai-assist-images-dev"
+)
 
 type fakeCopier struct {
 	got    ports.CopyToDurableParams
 	called int
 	retURI string
 	retErr error
+
+	// classifyErr, when set, is returned by ClassifyReference — used to
+	// prove the service fails loud BEFORE attempting any copy.
+	classifyErr error
 }
 
 func (f *fakeCopier) CopyToDurable(_ context.Context, p ports.CopyToDurableParams) (string, error) {
@@ -31,7 +47,49 @@ func (f *fakeCopier) CopyToDurable(_ context.Context, p ports.CopyToDurableParam
 	}
 	return f.retURI, nil
 }
+
 func (f *fakeCopier) DurableBucket() string { return durableBucket }
+
+// ClassifyReference mirrors the production adapter's grammar: s3:// and
+// gs:// on the durable bucket are durable; a path-style http(s) URL on the
+// transient bucket is transient; everything else is an error.
+func (f *fakeCopier) ClassifyReference(_ context.Context, raw string) (ports.MediaReference, error) {
+	if f.classifyErr != nil {
+		return ports.MediaReference{}, f.classifyErr
+	}
+	ref := strings.TrimSpace(raw)
+	for _, scheme := range []string{"s3://", "gs://"} {
+		if strings.HasPrefix(ref, scheme) {
+			rest := ref[len(scheme):]
+			i := strings.IndexByte(rest, '/')
+			if i <= 0 || i >= len(rest)-1 {
+				return ports.MediaReference{}, fmt.Errorf("malformed %s URI: %q", scheme, ref)
+			}
+			bucket, key := rest[:i], rest[i+1:]
+			if bucket != durableBucket {
+				return ports.MediaReference{}, fmt.Errorf("foreign %s bucket %q", scheme, bucket)
+			}
+			return ports.MediaReference{Kind: ports.MediaReferenceDurable, Bucket: bucket, Key: key}, nil
+		}
+	}
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		u, err := url.Parse(ref)
+		if err != nil {
+			return ports.MediaReference{}, fmt.Errorf("parse %q: %w", ref, err)
+		}
+		path := strings.TrimPrefix(u.Path, "/") // query (the signature) excluded
+		i := strings.IndexByte(path, '/')
+		if i <= 0 || i >= len(path)-1 {
+			return ports.MediaReference{}, fmt.Errorf("malformed path-style URL: %q", ref)
+		}
+		bucket, key := path[:i], path[i+1:]
+		if bucket != transientBucket {
+			return ports.MediaReference{}, fmt.Errorf("foreign http bucket %q", bucket)
+		}
+		return ports.MediaReference{Kind: ports.MediaReferenceTransient, Bucket: bucket, Key: key}, nil
+	}
+	return ports.MediaReference{}, fmt.Errorf("unrecognized reference %q", ref)
+}
 
 // Empty URL → no-op (no image to re-home).
 func TestReHome_EmptyURL_NoOp(t *testing.T) {
@@ -47,35 +105,60 @@ func TestReHome_EmptyURL_NoOp(t *testing.T) {
 	}
 }
 
-// Already-durable gs:// ref → idempotent passthrough, copier NOT called.
-func TestReHome_AlreadyDurable_Idempotent(t *testing.T) {
+// Already-durable s3:// ref (what the S3 adapter persists) → idempotent
+// passthrough, copier NOT called. This is the case that 500'd in
+// production: the old service only recognised gs://.
+func TestReHome_AlreadyDurableS3_Idempotent(t *testing.T) {
 	t.Parallel()
 	f := &fakeCopier{}
 	svc := mediarehome.New(f)
-	ref := "gs://" + durableBucket + "/tenants/t1/atoms/a1/obj.png"
+	ref := "s3://" + durableBucket + "/tenants/t1/atoms/a1/obj.png"
 	got, changed, err := svc.ReHome(context.Background(), "t1", "a1", ref)
 	if err != nil {
-		t.Fatalf("ReHome(durable) err = %v", err)
+		t.Fatalf("ReHome(durable s3://) err = %v", err)
 	}
 	if changed {
-		t.Error("ReHome(durable) changed=true; want false (idempotent)")
+		t.Error("ReHome(durable s3://) changed=true; want false (idempotent)")
 	}
 	if got != ref {
-		t.Errorf("ReHome(durable) = %q; want unchanged %q", got, ref)
+		t.Errorf("ReHome(durable s3://) = %q; want unchanged %q", got, ref)
 	}
 	if f.called != 0 {
 		t.Errorf("copier called %d times for already-durable ref; want 0", f.called)
 	}
 }
 
-// Transient path-style signed URL → copied; durable gs:// returned.
+// Already-durable gs:// ref → idempotent passthrough, copier NOT called
+// (kept so a GCS deployment still works).
+func TestReHome_AlreadyDurableGS_Idempotent(t *testing.T) {
+	t.Parallel()
+	f := &fakeCopier{}
+	svc := mediarehome.New(f)
+	ref := "gs://" + durableBucket + "/tenants/t1/atoms/a1/obj.png"
+	got, changed, err := svc.ReHome(context.Background(), "t1", "a1", ref)
+	if err != nil {
+		t.Fatalf("ReHome(durable gs://) err = %v", err)
+	}
+	if changed {
+		t.Error("ReHome(durable gs://) changed=true; want false (idempotent)")
+	}
+	if got != ref {
+		t.Errorf("ReHome(durable gs://) = %q; want unchanged %q", got, ref)
+	}
+	if f.called != 0 {
+		t.Errorf("copier called %d times for already-durable ref; want 0", f.called)
+	}
+}
+
+// Transient Garage/S3 path-style signed URL → copied; durable s3:// returned.
 func TestReHome_TransientPathStyle_Copies(t *testing.T) {
 	t.Parallel()
-	want := "gs://" + durableBucket + "/tenants/t1/atoms/a1/new.png"
+	want := "s3://" + durableBucket + "/tenants/t1/atoms/a1/new.png"
 	f := &fakeCopier{retURI: want}
 	svc := mediarehome.New(f)
 
-	src := "https://storage.googleapis.com/chora-ai-assist-images-dev/tenants/t1/jobs/j9/abc123.png?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Expires=604800"
+	src := "http://146.235.20.25:9000/" + transientBucket +
+		"/tenants/t1/jobs/j9/abc123.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=604800"
 	got, changed, err := svc.ReHome(context.Background(), "t1", "a1", src)
 	if err != nil {
 		t.Fatalf("ReHome(transient) err = %v", err)
@@ -89,8 +172,8 @@ func TestReHome_TransientPathStyle_Copies(t *testing.T) {
 	if f.called != 1 {
 		t.Fatalf("copier called %d times; want 1", f.called)
 	}
-	if f.got.SrcBucket != "chora-ai-assist-images-dev" {
-		t.Errorf("SrcBucket = %q; want chora-ai-assist-images-dev", f.got.SrcBucket)
+	if f.got.SrcBucket != transientBucket {
+		t.Errorf("SrcBucket = %q; want %s", f.got.SrcBucket, transientBucket)
 	}
 	if f.got.SrcKey != "tenants/t1/jobs/j9/abc123.png" {
 		t.Errorf("SrcKey = %q; want tenants/t1/jobs/j9/abc123.png (query stripped)", f.got.SrcKey)
@@ -103,19 +186,20 @@ func TestReHome_TransientPathStyle_Copies(t *testing.T) {
 	}
 }
 
-// Transient virtual-hosted signed URL → parsed correctly.
-func TestReHome_TransientVirtualHosted_Copies(t *testing.T) {
+// The service copies the coordinates + extension the adapter classified,
+// whatever bucket/key shape it reports.
+func TestReHome_TransientCoordinates_ForwardedVerbatim(t *testing.T) {
 	t.Parallel()
-	f := &fakeCopier{retURI: "gs://" + durableBucket + "/tenants/t/atoms/a/x.svg"}
+	f := &fakeCopier{retURI: "s3://" + durableBucket + "/tenants/t/atoms/a/x.svg"}
 	svc := mediarehome.New(f)
 
-	src := "https://chora-ai-assist-images-dev.storage.googleapis.com/tenants/t/jobs/j/d.svg?X-Goog-Expires=604800"
+	src := "https://storage.googleapis.com/" + transientBucket + "/tenants/t/jobs/j/d.svg?X-Goog-Expires=604800"
 	_, changed, err := svc.ReHome(context.Background(), "t", "a", src)
 	if err != nil || !changed {
-		t.Fatalf("ReHome(virtual-hosted) = (changed=%v, err=%v); want (true,nil)", changed, err)
+		t.Fatalf("ReHome(transient) = (changed=%v, err=%v); want (true,nil)", changed, err)
 	}
-	if f.got.SrcBucket != "chora-ai-assist-images-dev" {
-		t.Errorf("SrcBucket = %q; want chora-ai-assist-images-dev", f.got.SrcBucket)
+	if f.got.SrcBucket != transientBucket {
+		t.Errorf("SrcBucket = %q; want %s", f.got.SrcBucket, transientBucket)
 	}
 	if f.got.SrcKey != "tenants/t/jobs/j/d.svg" {
 		t.Errorf("SrcKey = %q; want tenants/t/jobs/j/d.svg", f.got.SrcKey)
@@ -125,22 +209,27 @@ func TestReHome_TransientVirtualHosted_Copies(t *testing.T) {
 	}
 }
 
-// Foreign gs:// bucket → fail loud (we never re-home an unexpected bucket).
-func TestReHome_ForeignGSBucket_Errors(t *testing.T) {
+// Foreign durable bucket → fail loud (we never re-home an unexpected bucket).
+func TestReHome_ForeignDurableBucket_Errors(t *testing.T) {
 	t.Parallel()
 	f := &fakeCopier{}
 	svc := mediarehome.New(f)
-	_, _, err := svc.ReHome(context.Background(), "t", "a", "gs://some-other-bucket/k.png")
-	if err == nil {
-		t.Fatal("ReHome(foreign gs://) should error; got nil")
+	for _, bad := range []string{
+		"gs://some-other-bucket/k.png",
+		"s3://some-other-bucket/k.png",
+	} {
+		_, _, err := svc.ReHome(context.Background(), "t", "a", bad)
+		if err == nil {
+			t.Errorf("ReHome(foreign %q) should error; got nil", bad)
+		}
 	}
 	if f.called != 0 {
-		t.Errorf("copier called for foreign gs://; want 0")
+		t.Errorf("copier called for foreign bucket; want 0")
 	}
 }
 
-// Non-GCS URL → fail loud.
-func TestReHome_NonGCSURL_Errors(t *testing.T) {
+// Unclassifiable refs → fail loud.
+func TestReHome_UnclassifiableRef_Errors(t *testing.T) {
 	t.Parallel()
 	svc := mediarehome.New(&fakeCopier{})
 	for _, bad := range []string{
@@ -154,14 +243,38 @@ func TestReHome_NonGCSURL_Errors(t *testing.T) {
 	}
 }
 
+// A classification failure aborts BEFORE any copy — the fail-loud-before-
+// persist guarantee (an unclassifiable ref must never be persisted as-is,
+// nor blindly copied).
+func TestReHome_ClassifyError_NoCopyAttempted(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("foreign bucket")
+	f := &fakeCopier{classifyErr: sentinel}
+	svc := mediarehome.New(f)
+	got, changed, err := svc.ReHome(context.Background(), "t", "a",
+		"http://146.235.20.25:9000/some-other-bucket/tenants/t/jobs/j/x.png?X-Amz-Signature=deadbeef")
+	if err == nil {
+		t.Fatal("ReHome should propagate the classification error; got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap the classifier sentinel", err)
+	}
+	if got != "" || changed {
+		t.Errorf("ReHome(classify error) = (%q,%v); want (\"\",false)", got, changed)
+	}
+	if f.called != 0 {
+		t.Errorf("copier called %d times after a classification error; want 0", f.called)
+	}
+}
+
 // Copier failure is propagated (fail-loud, not swallowed).
 func TestReHome_CopierError_Propagates(t *testing.T) {
 	t.Parallel()
-	sentinel := errors.New("gcs boom")
+	sentinel := errors.New("s3 boom")
 	f := &fakeCopier{retErr: sentinel}
 	svc := mediarehome.New(f)
 	_, _, err := svc.ReHome(context.Background(), "t", "a",
-		"https://storage.googleapis.com/chora-ai-assist-images-dev/tenants/t/jobs/j/x.png?sig=1")
+		"https://storage.googleapis.com/"+transientBucket+"/tenants/t/jobs/j/x.png?sig=1")
 	if err == nil {
 		t.Fatal("ReHome should propagate copier error; got nil")
 	}
@@ -173,10 +286,10 @@ func TestReHome_CopierError_Propagates(t *testing.T) {
 // Key with no extension → defaults to png (the orchestrator's default).
 func TestReHome_NoExtension_DefaultsPNG(t *testing.T) {
 	t.Parallel()
-	f := &fakeCopier{retURI: "gs://" + durableBucket + "/tenants/t/atoms/a/x.png"}
+	f := &fakeCopier{retURI: "s3://" + durableBucket + "/tenants/t/atoms/a/x.png"}
 	svc := mediarehome.New(f)
 	_, _, err := svc.ReHome(context.Background(), "t", "a",
-		"https://storage.googleapis.com/chora-ai-assist-images-dev/tenants/t/jobs/j/noext?sig=1")
+		"https://storage.googleapis.com/"+transientBucket+"/tenants/t/jobs/j/noext?sig=1")
 	if err != nil {
 		t.Fatalf("ReHome err = %v", err)
 	}
@@ -188,8 +301,13 @@ func TestReHome_NoExtension_DefaultsPNG(t *testing.T) {
 func TestReHome_ErrorsAreNamespaced(t *testing.T) {
 	t.Parallel()
 	svc := mediarehome.New(&fakeCopier{})
-	_, _, err := svc.ReHome(context.Background(), "t", "a", "gs://other/k.png")
-	if err == nil || !strings.Contains(err.Error(), "mediarehome") {
-		t.Errorf("error %v should be namespaced with 'mediarehome'", err)
+	for _, bad := range []string{
+		"gs://other/k.png",
+		"https://evil.example.com/x.png",
+	} {
+		_, _, err := svc.ReHome(context.Background(), "t", "a", bad)
+		if err == nil || !strings.Contains(err.Error(), "mediarehome") {
+			t.Errorf("error %v should be namespaced with 'mediarehome'", err)
+		}
 	}
 }
