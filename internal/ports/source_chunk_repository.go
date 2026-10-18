@@ -6,8 +6,11 @@
 // ai_assist completed-event subscriber loads the job's chunks for the D15
 // citation-verification pass. The store is reuse-ready for KG / growth-edge
 // / daily-dose grounding (embedding column lives in the schema; v1 writes
-// no embeddings) — future consumers arrive via the chora-creation
-// ContentRetrieval.SearchEmbeddings gRPC seam, never via cross-DB SQL.
+// no embeddings) — future consumers arrive through a creation-owned service
+// seam, never via cross-DB SQL. Two such seams exist today:
+// ContentRetrieval.SearchEmbeddings (semantic atom search) and
+// GET /api/internal/question-jobs/{job_id}/source-material (a job's
+// extracted text, for grounding a generator turn).
 package ports
 
 import (

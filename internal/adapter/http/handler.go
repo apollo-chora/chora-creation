@@ -455,6 +455,16 @@ func NewRouterWithDeps(deps RouterDeps) http.Handler {
 	// immaterial. The emit is a fail-loud 500 when the publisher is unwired.
 	mux.HandleFunc("/api/internal/atoms/backfill-published", h.backfillPublished)
 
+	// Grounding read seam — GET /api/internal/question-jobs/{job_id}/source-material
+	// returns the job's extracted, page-referenced text so a generator can
+	// ground on TEXT instead of a FileData blob the model gateway cannot carry.
+	// Same /api/internal/* convention: no tenant-header gate, so the handler
+	// requires tenant_id itself and fails loud without it. Guarded on
+	// jobsHandler because a partially-wired boot leaves it nil.
+	if h.jobsHandler != nil {
+		mux.HandleFunc(sourceMaterialRoutePrefix, h.jobsHandler.getSourceMaterial)
+	}
+
 	// CHO-2273 follow-up — POST /api/internal/atoms/backfill-atom-index re-emits
 	// atom.created.v1 (the UPSERT that CREATES the atom_index row with the derived
 	// key) for every published, non-orphan atom, seeding rows that
