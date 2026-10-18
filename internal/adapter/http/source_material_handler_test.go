@@ -1,8 +1,9 @@
 // source_material_handler_test.go — the grounding read seam.
 //
 // The behaviour under test is what a generator depends on to ground on TEXT:
-// tenant+job scoping, page attribution that survives to the wire, and an
-// honest `complete` flag when the char budget truncates the document.
+// tenant+job scoping, page attribution that survives to the wire, honest
+// budget-completeness reporting, and — critically — never returning zero
+// text for a document that does have text.
 
 package httpadapter
 
@@ -14,8 +15,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/apollo-chora/chora-creation/internal/domain/question"
 	"github.com/apollo-chora/chora-creation/internal/domain/sourcechunk"
+	"github.com/apollo-chora/chora-creation/internal/ports"
 )
 
 func pageNo(n int) *int { return &n }
@@ -43,6 +47,17 @@ func (s *stubChunkRepo) ListByJob(_ context.Context, tenantID, jobID string) ([]
 		}
 	}
 	return out, nil
+}
+
+// stubJobRepo satisfies the whole port by embedding it; only Get is exercised.
+type stubJobRepo struct {
+	ports.QuestionJobRepository
+	job *question.ComposeJob
+	err error
+}
+
+func (s *stubJobRepo) Get(_ context.Context, _, _ string) (*question.ComposeJob, error) {
+	return s.job, s.err
 }
 
 // sourceMaterialHandler builds just enough handler to serve the route.
@@ -82,8 +97,8 @@ func TestGetSourceMaterial_PagedChunksKeepPageAndRole(t *testing.T) {
 		t.Fatalf("status = %d; want 200 (body %s)", rec.Code, rec.Body.String())
 	}
 	body := decodeBody(t, rec)
-	if !body.Complete {
-		t.Error("complete = false; want true (no budget pressure)")
+	if !body.ChunksComplete {
+		t.Error("chunks_complete = false; want true (no budget pressure)")
 	}
 	if len(body.Chunks) != 2 {
 		t.Fatalf("chunks = %d; want 2", len(body.Chunks))
@@ -135,26 +150,101 @@ func TestGetSourceMaterial_UnpagedOmitsPageNo(t *testing.T) {
 	}
 }
 
-func TestGetSourceMaterial_TruncationStopsBeforeCrossingChunk(t *testing.T) {
-	// Two 10-char chunks; a 15-char budget fits the first only.
+// The counterexample that motivated the partial-chunk rule: a paged PDF keeps
+// a whole page as ONE chunk with no size cap, so a single oversized page must
+// still yield its prefix rather than nothing.
+func TestGetSourceMaterial_OversizedFirstChunkStillGrounds(t *testing.T) {
+	big := strings.Repeat("x", 50_000)
+	repo := &stubChunkRepo{chunks: []sourcechunk.Chunk{
+		{JobID: "job-4", TenantID: "t-1", FileURI: "f", FileRole: "source", ChunkIndex: 0, PageNo: pageNo(1), Text: big},
+		{JobID: "job-4", TenantID: "t-1", FileURI: "f", FileRole: "source", ChunkIndex: 1, PageNo: pageNo(2), Text: "second page"},
+	}}
+	rec := get(t, sourceMaterialHandler(repo), "/api/internal/question-jobs/job-4/source-material?tenant_id=t-1&max_bytes=1000")
+
+	body := decodeBody(t, rec)
+	if len(body.Chunks) != 1 {
+		t.Fatalf("chunks = %d; want 1 — an oversized page must yield a prefix, not nothing", len(body.Chunks))
+	}
+	if len(body.Chunks[0].Text) != 1000 {
+		t.Errorf("text length = %d; want the full 1000-byte budget used", len(body.Chunks[0].Text))
+	}
+	if body.Chunks[0].PageNo == nil || *body.Chunks[0].PageNo != 1 {
+		t.Error("a prefix of page 1 is still page 1 — attribution must survive truncation")
+	}
+	if body.ChunksComplete {
+		t.Error("chunks_complete = true; want false — the material was truncated")
+	}
+}
+
+func TestGetSourceMaterial_TruncationPrefersPartialOverDropping(t *testing.T) {
 	repo := &stubChunkRepo{chunks: []sourcechunk.Chunk{
 		{JobID: "job-3", TenantID: "t-1", FileURI: "f", FileRole: "source", ChunkIndex: 0, PageNo: pageNo(1), Text: "0123456789"},
 		{JobID: "job-3", TenantID: "t-1", FileURI: "f", FileRole: "source", ChunkIndex: 1, PageNo: pageNo(2), Text: "abcdefghij"},
 	}}
-	rec := get(t, sourceMaterialHandler(repo), "/api/internal/question-jobs/job-3/source-material?tenant_id=t-1&max_chars=15")
+	rec := get(t, sourceMaterialHandler(repo), "/api/internal/question-jobs/job-3/source-material?tenant_id=t-1&max_bytes=15")
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d; want 200", rec.Code)
-	}
 	body := decodeBody(t, rec)
-	if body.Complete {
-		t.Error("complete = true; want false — the budget truncated the document")
+	if body.ChunksComplete {
+		t.Error("chunks_complete = true; want false")
 	}
-	if len(body.Chunks) != 1 {
-		t.Fatalf("chunks = %d; want 1 (must not cut a chunk in half)", len(body.Chunks))
+	if len(body.Chunks) != 2 {
+		t.Fatalf("chunks = %d; want 2 (first whole + partial second)", len(body.Chunks))
 	}
 	if body.Chunks[0].Text != "0123456789" {
-		t.Errorf("chunk text = %q; want the intact first chunk", body.Chunks[0].Text)
+		t.Errorf("chunk[0] = %q; want the intact first chunk", body.Chunks[0].Text)
+	}
+	if body.Chunks[1].Text != "abcde" {
+		t.Errorf("chunk[1] = %q; want the 5 bytes the budget still allows", body.Chunks[1].Text)
+	}
+}
+
+func TestGetSourceMaterial_TruncationNeverSplitsARune(t *testing.T) {
+	// "é" is 2 bytes; a 5-byte budget would cut the third one in half.
+	repo := &stubChunkRepo{chunks: []sourcechunk.Chunk{
+		{JobID: "job-5", TenantID: "t-1", FileURI: "f", FileRole: "source", ChunkIndex: 0, PageNo: pageNo(1), Text: "éééé"},
+	}}
+	rec := get(t, sourceMaterialHandler(repo), "/api/internal/question-jobs/job-5/source-material?tenant_id=t-1&max_bytes=5")
+
+	body := decodeBody(t, rec)
+	if len(body.Chunks) != 1 {
+		t.Fatalf("chunks = %d; want 1", len(body.Chunks))
+	}
+	if !utf8.ValidString(body.Chunks[0].Text) {
+		t.Fatalf("truncated text is not valid UTF-8: %q", body.Chunks[0].Text)
+	}
+	if body.Chunks[0].Text != "éé" {
+		t.Errorf("text = %q; want the two whole runes that fit in 5 bytes", body.Chunks[0].Text)
+	}
+}
+
+func TestGetSourceMaterial_UnknownJobIs404(t *testing.T) {
+	h := sourceMaterialHandler(&stubChunkRepo{})
+	h.jobRepo = &stubJobRepo{err: question.ErrNotFound}
+	rec := get(t, h, "/api/internal/question-jobs/job-1/source-material?tenant_id=t-1")
+	// A forged (tenant, job) pair must not look like a job with no text.
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d; want 404", rec.Code)
+	}
+}
+
+func TestGetSourceMaterial_AuthorMismatchIs403(t *testing.T) {
+	h := sourceMaterialHandler(&stubChunkRepo{})
+	h.jobRepo = &stubJobRepo{job: &question.ComposeJob{AuthorGCID: "gcid-owner"}}
+	rec := get(t, h, "/api/internal/question-jobs/job-1/source-material?tenant_id=t-1&author_gcid=gcid-other")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d; want 403", rec.Code)
+	}
+}
+
+func TestGetSourceMaterial_AuthorMatchPasses(t *testing.T) {
+	repo := &stubChunkRepo{chunks: []sourcechunk.Chunk{
+		{JobID: "job-1", TenantID: "t-1", FileURI: "f", FileRole: "source", Text: "text"},
+	}}
+	h := sourceMaterialHandler(repo)
+	h.jobRepo = &stubJobRepo{job: &question.ComposeJob{AuthorGCID: "gcid-owner"}}
+	rec := get(t, h, "/api/internal/question-jobs/job-1/source-material?tenant_id=t-1&author_gcid=gcid-owner")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", rec.Code)
 	}
 }
 
@@ -210,14 +300,15 @@ func TestGetSourceMaterial_UnwiredStoreIs503(t *testing.T) {
 
 func TestGetSourceMaterial_EmptyIsSuccess(t *testing.T) {
 	// Image-only batches legitimately have no text layer, and a job whose
-	// extraction failed stores nothing. Neither is an error.
+	// extraction failed stores nothing. Neither is an error — which is exactly
+	// why chunks_complete must not be read as "the whole corpus is here".
 	rec := get(t, sourceMaterialHandler(&stubChunkRepo{}), "/api/internal/question-jobs/job-x/source-material?tenant_id=t-1")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d; want 200", rec.Code)
 	}
 	body := decodeBody(t, rec)
-	if !body.Complete {
-		t.Error("complete = false; want true for a legitimately empty job")
+	if !body.ChunksComplete {
+		t.Error("chunks_complete = false; want true for a legitimately empty job")
 	}
 	if len(body.Chunks) != 0 {
 		t.Errorf("chunks = %d; want 0", len(body.Chunks))
@@ -227,26 +318,26 @@ func TestGetSourceMaterial_EmptyIsSuccess(t *testing.T) {
 	}
 }
 
-func TestGetSourceMaterial_BadMaxCharsIs400(t *testing.T) {
-	rec := get(t, sourceMaterialHandler(&stubChunkRepo{}), "/api/internal/question-jobs/job-1/source-material?tenant_id=t-1&max_chars=lots")
+func TestGetSourceMaterial_BadMaxBytesIs400(t *testing.T) {
+	rec := get(t, sourceMaterialHandler(&stubChunkRepo{}), "/api/internal/question-jobs/job-1/source-material?tenant_id=t-1&max_bytes=lots")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d; want 400", rec.Code)
 	}
 }
 
-func TestSourceMaterialMaxChars_DefaultCeilingAndFloor(t *testing.T) {
+func TestSourceMaterialMaxBytes_DefaultCeilingAndFloor(t *testing.T) {
 	cases := []struct {
 		in   string
 		want int
 	}{
-		{"", sourceMaterialDefaultMaxChars},
-		{"0", sourceMaterialDefaultMaxChars},
-		{"-5", sourceMaterialDefaultMaxChars},
+		{"", sourceMaterialDefaultMaxBytes},
+		{"0", sourceMaterialDefaultMaxBytes},
+		{"-5", sourceMaterialDefaultMaxBytes},
 		{"500", 500},
-		{"999999999", sourceMaterialMaxCharsCeiling},
+		{"999999999", sourceMaterialMaxBytesCeiling},
 	}
 	for _, c := range cases {
-		got, err := sourceMaterialMaxChars(c.in)
+		got, err := sourceMaterialMaxBytes(c.in)
 		if err != nil {
 			t.Fatalf("%q: unexpected error %v", c.in, err)
 		}
@@ -254,7 +345,7 @@ func TestSourceMaterialMaxChars_DefaultCeilingAndFloor(t *testing.T) {
 			t.Errorf("%q: got %d; want %d", c.in, got, c.want)
 		}
 	}
-	if _, err := sourceMaterialMaxChars("abc"); err == nil {
+	if _, err := sourceMaterialMaxBytes("abc"); err == nil {
 		t.Error("expected an error for a non-integer budget")
 	}
 }
